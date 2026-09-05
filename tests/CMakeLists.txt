@@ -6,6 +6,14 @@ target_link_libraries(status_test PRIVATE bedrockkv GTest::gtest_main)
 add_executable(skiplist_test skiplist_test.cpp)
 target_link_libraries(skiplist_test PRIVATE bedrockkv GTest::gtest_main)
 
+add_executable(crc32_test crc32_test.cpp)
+target_link_libraries(crc32_test PRIVATE bedrockkv GTest::gtest_main)
+
+add_executable(log_test log_test.cpp)
+target_link_libraries(log_test PRIVATE bedrockkv GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(status_test)
 gtest_discover_tests(skiplist_test)
+gtest_discover_tests(crc32_test)
+gtest_discover_tests(log_test)
