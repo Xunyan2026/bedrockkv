@@ -179,4 +179,35 @@ TEST(SkipListTest, ConcurrentReadersDuringWrites) {
   }
 }
 
+TEST(SkipListTest, CustomComparatorDescendingOrder) {
+  // The template must work with any strict weak ordering. A reversed
+  // comparator makes the iterator walk keys from largest to smallest —
+  // exactly the pattern the MemTable will use (user key asc, tag desc).
+  struct ReverseComp {
+    bool operator()(const std::string& a, const std::string& b) const {
+      return a > b;
+    }
+  };
+  bedrockkv::SkipListT<ReverseComp> list;
+  for (uint64_t n : {5, 1, 3}) {
+    ASSERT_TRUE(list.Insert(MakeKey(n)));
+  }
+  EXPECT_FALSE(list.Insert(MakeKey(3)));  // duplicate under the comparator
+
+  bedrockkv::SkipListT<ReverseComp>::Iterator it(&list);
+  it.SeekToFirst();
+  for (uint64_t expected : {5, 3, 1}) {
+    ASSERT_TRUE(it.Valid());
+    EXPECT_EQ(it.key(), MakeKey(expected));
+    it.Next();
+  }
+  EXPECT_FALSE(it.Valid());
+
+  // Seek targets the first key >= target under the reversed ordering,
+  // i.e. the largest key <= the target numerically.
+  it.Seek(MakeKey(4));
+  ASSERT_TRUE(it.Valid());
+  EXPECT_EQ(it.key(), MakeKey(3));
+}
+
 }  // namespace
