@@ -12,8 +12,16 @@ target_link_libraries(crc32_test PRIVATE bedrockkv GTest::gtest_main)
 add_executable(log_test log_test.cpp)
 target_link_libraries(log_test PRIVATE bedrockkv GTest::gtest_main)
 
+add_executable(db_test db_test.cpp)
+target_link_libraries(db_test PRIVATE bedrockkv GTest::gtest_main)
+
+add_executable(memtable_test memtable_test.cpp)
+target_link_libraries(memtable_test PRIVATE bedrockkv GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(status_test)
 gtest_discover_tests(skiplist_test)
 gtest_discover_tests(crc32_test)
 gtest_discover_tests(log_test)
+gtest_discover_tests(db_test)
+gtest_discover_tests(memtable_test)
