@@ -4,29 +4,11 @@
 #include <cstring>
 
 #include "bedrockkv/crc32.h"
+#include "bedrockkv/encoding.h"
 
 #include <unistd.h>  // ::read / ::write
 
 namespace bedrockkv::log {
-namespace {
-
-// Little-endian fixed32 encoding: keeps WAL files byte-identical across
-// architectures (big-endian machines would otherwise write other bytes).
-void PutFixed32(char* dst, uint32_t v) {
-  dst[0] = static_cast<char>(v & 0xffu);
-  dst[1] = static_cast<char>((v >> 8) & 0xffu);
-  dst[2] = static_cast<char>((v >> 16) & 0xffu);
-  dst[3] = static_cast<char>((v >> 24) & 0xffu);
-}
-
-uint32_t GetFixed32(const char* src) {
-  return static_cast<uint32_t>(static_cast<unsigned char>(src[0])) |
-         (static_cast<uint32_t>(static_cast<unsigned char>(src[1])) << 8) |
-         (static_cast<uint32_t>(static_cast<unsigned char>(src[2])) << 16) |
-         (static_cast<uint32_t>(static_cast<unsigned char>(src[3])) << 24);
-}
-
-}  // namespace
 
 // ---- Writer ----------------------------------------------------------------
 

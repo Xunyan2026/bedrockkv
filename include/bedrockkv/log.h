@@ -41,7 +41,13 @@ enum RecordType : uint8_t {
 // fsync — the caller (the future DB layer) owns the durability policy.
 class Writer {
  public:
-  explicit Writer(int fd) : fd_(fd) {}
+  // `initial_file_offset` is the byte offset the writer starts at — for an
+  // appender reopening an existing log this MUST be the current file size,
+  // otherwise block-fragmentation decisions are made against the wrong
+  // in-block position and the file becomes unreadable at real block
+  // boundaries. Defaults to 0 (fresh file).
+  explicit Writer(int fd, uint64_t initial_file_offset = 0)
+      : fd_(fd), block_offset_(initial_file_offset % kBlockSize) {}
 
   Status AddRecord(std::string_view payload);
   // Offset within the current block (diagnostics only).
