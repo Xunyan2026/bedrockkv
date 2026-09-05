@@ -35,6 +35,7 @@ FetchContent_MakeAvailable(googletest)
 # headers as "bedrockkv/status.h", mirroring the installed layout.
 add_library(bedrockkv
   src/status.cpp
+  src/skiplist.cpp
 )
 target_include_directories(bedrockkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
