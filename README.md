@@ -1,93 +1,144 @@
 # BedrockKV
 
-A high-performance, persistent LSM-Tree based key-value storage engine written in C++20.
+**A persistent LSM-Tree key-value storage engine in C++20 — WAL, leveled
+compaction, WiscKey value separation, io_uring, MVCC snapshots, and a
+Redis-compatible wire server. Zero third-party dependencies.**
 
-> 🚧 Work in progress. This README will grow with architecture diagrams and
-> benchmark data as the project reaches its milestones. Roadmap: WAL +
-> MemTable → SSTable + Leveled Compaction → YCSB harness → WiscKey value
-> separation (done) + io_uring async I/O → Redis RESP2-compatible server →
-> benchmarks vs. LevelDB.
+[![CI](https://github.com/Xunyan2026/bedrockkv/actions/workflows/ci.yml/badge.svg)](https://github.com/Xunyan2026/bedrockkv/actions/workflows/ci.yml)
 
-## Build
+Built from scratch: the WAL format, skiplist, SSTable layout, Bloom
+filters, compaction picker, MVCC visibility rules, the io_uring ring
+(raw syscalls), and the RESP2 protocol parser are all hand-written —
+the only dependency is GoogleTest, for the 102 tests that pin it all
+down (Release + ASan/UBSan + TSan, plus libFuzzer targets in CI).
+
+## The headline numbers
+
+| What | Result | How |
+|---|---|---|
+| Write amplification (YCSB-A, 1 KiB values) | **4.88x → 2.26x** | WiscKey value separation: the LSM moves 21-byte pointers, values append once to a vLog |
+| Tail latency (YCSB-A max) | **580 ms → 40 ms** | Compaction volume collapses (37 → 0 compactions/run) — nothing left to stall the writer |
+| redis-benchmark GET, pipeline=16 | **278k req/s = 87% of real Redis 7.2**, same host | RESP2 over a hand-written epoll event loop; read path is memory-only |
+| libFuzzer, 3 targets (RESP / WAL / full server) | **26M+ execs, zero findings** | Invariant-driven harnesses; WAL recovery invariant fuzzed: truncate at last-good-end ⇒ clean replay |
+
+Details, methodology, and honest caveats (gVisor sandbox, tmpfs fsync,
+the scan tax value separation pays): [docs/benchmarks.md](docs/benchmarks.md).
+
+## 30-second demo
+
+```console
+$ ./build/bedrockkv-server --port 7379 --dir /tmp/bedrockkv-demo --sync always
+bedrockkv-server listening on port 7379 (dir: /tmp/bedrockkv-demo)
+
+$ redis-cli -p 7379 set greeting "hello, bedrockkv"
+OK
+$ redis-cli -p 7379 get greeting
+"hello, bedrockkv"
+$ redis-cli -p 7379 del greeting
+(integer) 1
+$ redis-cli -p 7379 ping
+PONG
+^C   # kill the server — restart on the same dir
+
+$ ./build/bedrockkv-server --port 7379 --dir /tmp/bedrockkv-demo --sync always
+$ redis-cli -p 7379 get greeting          # survived the restart
+"hello, bedrockkv"
+```
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph clients [" "]
+        RC[redis-cli / redis-benchmark]
+    end
+    subgraph server ["bedrockkv-server — 1 event-loop thread (epoll LT)"]
+        RESP["RESP2 parser<br/>SET GET DEL EXISTS PING ECHO"]
+    end
+    subgraph engine ["DB — 1 writer + N lock-free readers + 1 background thread"]
+        direction TB
+        W[Put / Delete] --> WAL[WAL<br/>32 KiB chunks · CRC · torn-tail truncation]
+        WAL --> MEM[MemTable<br/>skiplist · tag = seq&#8858;8 + type]
+        MEM -- "rotate at 4 MiB" --> IMM[immutable memtable]
+        IMM -- "background flush" --> L0[L0 SSTs<br/>(overlapping, newest first)]
+        L0 -- "size-tiered" --> L1[L1..L6 SSTs<br/>leveled compaction]
+        VLOG[vLog<br/>append-only values ≥ 1 KiB<br/>+ full-rewrite GC]
+        MAN[("MANIFEST<br/>SST list · live vLogs · replay floor")]
+        SNAP["MVCC snapshots<br/>read at any past sequence"]
+    end
+    RC --> RESP --> W
+    RESP --> R[Get / Scan] --> MEM & L0 & L1
+    R -- "21-byte pointer" --> VLOG
+```
+
+- **Internal key** `[klen][user_key][tag=(seq<<8)|type][value]`, sorted
+  by user key then tag *descending* — the newest version of a key is
+  one `Seek` away, and "everything visible at snapshot S" is one
+  contiguous run.
+- **Crash safety**: the MANIFEST is the sole on-disk truth, atomically
+  rewritten (tmp + rename + dir fsync); recovery replays every log
+  generation ≥ the published floor and truncates a torn WAL tail at the
+  last intact record. kill -9 tested at every ordering boundary.
+- **Snapshots**: `GetSnapshot()` pins a sequence; reads through it see
+  exactly the writes up to that point across flushes and compactions
+  (leveldb's retention rule); vLog GC defers while snapshots live.
+- **Value separation**: compaction traffic drops from "every byte ever
+  written, several times" to "one pointer per key" (format + crash
+  story: [docs/vlog-format.md](docs/vlog-format.md)).
+- **io_uring**: a vendored ~200-line ring (raw syscalls + mmap). Where
+  the kernel lacks it (gVisor: ENOSYS), the engine degrades honestly —
+  `io_uring_active() == false` with the reason, control run byte-identical.
+
+## Build & test
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+git clone git@github.com:Xunyan2026/bedrockkv.git
+cd bedrockkv
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure      # 102 tests
 ```
 
-Requirements: Linux, CMake ≥ 3.16, a C++20 compiler (GCC ≥ 11 / Clang ≥ 13).
+Requirements: Linux, CMake ≥ 3.16, a C++20 compiler (GCC ≥ 11 /
+Clang ≥ 13). No other dependencies.
 
-## Value separation (WiscKey)
+Run the YCSB harness (reproduces every number in docs/benchmarks.md):
 
-`Options::enable_value_separation` moves values ≥
-`value_separation_threshold` (default 1 KiB) out of the LSM tree into an
-append-only value log: the LSM stores a fixed 21-byte pointer, compactions
-rewrite pointers instead of payload, and a threshold-triggered full-rewrite
-GC reclaims garbage. On YCSB-A this cuts write amplification 4.88x → 2.26x
-and tail latency 572 ms → 40 ms (numbers and method:
-`docs/benchmarks.md`; on-disk format and crash story:
-`docs/vlog-format.md`). Known simplification: a user value that happens to
-be exactly 21 bytes starting with `0xFF` is indistinguishable from a
-pointer — documented in the format spec, removable with a metadata byte.
-
-## Async I/O (io_uring)
-
-`Options::enable_io_uring` activates a hand-rolled io_uring ring (raw
-syscalls + mmap, no liburing). Where the kernel supports it: WAL records
-go out as explicit-offset pwrite SQEs (shared fragmentation code with the
-sync path, byte-identical output) and the vLog + WAL fsyncs run as one
-parallel SQE pair. Where it doesn't — this project's gVisor sandbox
-returns ENOSYS — the engine opens identically on the synchronous path,
-`io_uring_active()` reports false with the kernel's reason, and a control
-run proves the fallback is byte-for-byte the baseline. Design analysis of
-what io_uring can and cannot buy a single-writer engine:
-`docs/benchmarks.md` (stage 3 batch 3 section).
-
-## Redis-compatible server (stage 4)
-
-The engine speaks RESP2 over TCP — redis-cli and redis-benchmark connect
-out of the box:
-
-```sh
-./build/bedrockkv-server --port 7379 --dir /tmp/bedrockkv-demo
-redis-cli -p 7379 set greeting hello     # +OK
-redis-cli -p 7379 get greeting           # "hello"
+```bash
+./build/ycsb_bench --workload all --recordcount 100000 \
+    --operationcount 100000 --value_size 1024 [--vsep] [--io_uring]
 ```
 
-Commands: `SET / GET / DEL / EXISTS / PING / ECHO`, binary-safe keys and
-values, inline commands for telnet sessions, pipelining (many commands
-per packet, one reply batch). Transport is a hand-written epoll
-(level-triggered) + non-blocking-fd event loop: one thread accepts,
-parses, executes and replies — Redis' own single-threaded model, which
-also satisfies the engine's single-writer `Put` contract with zero
-locks. Protocol errors close the connection with `-ERR`, exactly like
-real Redis; clients that stop reading are evicted once their reply
-backlog crosses 64 MiB.
+## Documentation
 
-Stock `redis-benchmark` drives it out of the box (same-host numbers,
-gVisor sandbox): with pipelining, 278k GET and 91k SET req/s — within
-85% of real Redis 7.2 on the read path. The protocol layer and WAL
-replayer are coverage-guided fuzz targets (libFuzzer, 23M+ execs, zero
-findings; short fuzz smokes run in CI): numbers and analysis in
-`docs/benchmarks.md`.
+| Doc | Contents |
+|---|---|
+| [docs/design.md](docs/design.md) | **Why it's shaped this way** — each module's decision, rejected alternatives, and the bugs that taught something |
+| [docs/benchmarks.md](docs/benchmarks.md) | Every number with its reproducible command; before/after for each optimization; redis-benchmark vs Redis 7.2; fuzzing |
+| [docs/sstable-format.md](docs/sstable-format.md) | On-disk SSTable layout spec |
+| [docs/vlog-format.md](docs/vlog-format.md) | vLog format, GC algorithm, crash story, known limitations |
 
-## MVCC snapshots (stage 4)
+## Quality posture
 
-`DB::GetSnapshot()` captures an immutable read point in the sequence
-timeline: reads through it (`Get`/`Scan` overloads) see exactly the
-writes up to that point, whatever is written, flushed or compacted
-afterwards — the standard leveldb MVCC scheme. Snapshot-aware
-compaction retains every version above the oldest live snapshot's
-sequence (plus the newest one at or below it) instead of collapsing to
-newest-only, and the vLog GC defers entirely while a snapshot lives —
-its liveness check reads latest state, which cannot know what a
-snapshot still pins. Snapshots are in-memory only: they do not survive
-a restart, and releasing the last one re-enables full version
-collapse. Randomized model testing (snapshot reads vs. frozen shadow
-maps across flush + compaction churn) under ASan/TSan backs the
-implementation.
+- **102 gtest tests** across three sanitizer builds (ASan/UBSan, TSan),
+  `-Werror`, zero warnings; randomized model tests against `std::map`
+  shadows that deliberately cross flush/compaction boundaries; crash
+  tests with real `kill -9`.
+- **libFuzzer targets** for the RESP parser, WAL replay, and the full
+  server path — CI runs a 60-second smoke of each on every push.
+- **Honest benchmarking**: fixed-seed YCSB harness in-repo; known
+  sandbox artifacts (tmpfs fsync, gVisor loopback RTT) called out
+  rather than hidden; control runs proving opt-in paths change nothing
+  when disabled.
+
+## Roadmap
+
+Done: WAL + MemTable → SSTable + leveled compaction → YCSB harness →
+WiscKey value separation + vLog GC → io_uring → RESP2 server →
+MVCC snapshots. Next: async flush (kill the 40 ms rotation stall),
+group commit (unlocks io_uring write batching), block cache +
+pread-backed tables.
 
 ## License
 
-MIT (to be finalized at v1.0).
+MIT (finalized at v1.0).

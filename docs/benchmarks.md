@@ -204,7 +204,7 @@ Reading the table honestly:
   the *ratio* is what transfers, and it says the kSyncAlways code path
   adds no locking or extra syscalls beyond the fsyncs themselves.
 * **Pipelining (P=16) exposes the real server.** GET reaches 278k req/s —
-  85% of real Redis — because the read path is memory-only. SET reaches
+  87% of real Redis — because the read path is memory-only. SET reaches
   91k (30% of Redis): each SET pays WAL record encode + memtable insert
   + the benchmark's separate key writes, all on the single event-loop
   thread. That is the honest price of persisting at all; Redis
@@ -229,3 +229,12 @@ Zero crashes, hangs, or invariant violations. CI runs each harness as a
 60-second smoke on every push; the seeds in tests/fuzz/seeds/ pin the
 interesting input shapes (binary-safe args, truncated multibulks, bad
 CRCs, torn WAL tails) so the fuzzer never starts from zero coverage.
+
+![bedrockkv vs Redis 7.2 across redis-benchmark pipelines](benchmarks-stage4.png)
+
+Figure: stock redis-benchmark, same host, loopback. At pipeline=1 the
+gVisor loopback round trip (~1.5 ms) latency-bounds every server into
+the same ~17–19k band. At pipeline=16 the read path (memory-only)
+reaches 87% of real Redis, while SET pays for durability Redis skips
+(appendonly off): WAL encode + memtable insert on the event-loop
+thread.
