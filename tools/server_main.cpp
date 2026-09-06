@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
   uint16_t port = 7379;
   std::string dir = "/tmp/bedrockkv-server";
   bool value_separation = false;
+  bedrockkv::SyncMode sync_mode = bedrockkv::SyncMode::kSyncNever;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -40,16 +41,32 @@ int main(int argc, char** argv) {
       dir = next("--dir");
     } else if (arg == "--value-separation") {
       value_separation = true;
+    } else if (arg == "--sync") {
+      // Durability knob (Options::sync_mode). `never` (the default) is the
+      // honest peer of stock Redis' default persistence: writes land in
+      // the OS page cache, acknowledged, no fsync on the ack path.
+      const std::string mode = next("--sync");
+      if (mode == "always") {
+        sync_mode = bedrockkv::SyncMode::kSyncAlways;
+      } else if (mode == "periodic") {
+        sync_mode = bedrockkv::SyncMode::kSyncPeriodic;
+      } else if (mode == "never") {
+        sync_mode = bedrockkv::SyncMode::kSyncNever;
+      } else {
+        std::fprintf(stderr, "unknown --sync mode '%s'\n", mode.c_str());
+        return 2;
+      }
     } else {
       std::fprintf(stderr,
                    "usage: bedrockkv-server [--port N] [--dir PATH] "
-                   "[--value-separation]\n");
+                   "[--value-separation] [--sync always|periodic|never]\n");
       return 2;
     }
   }
 
   bedrockkv::Options options;
   options.enable_value_separation = value_separation;
+  options.sync_mode = sync_mode;
   bedrockkv::Status s = bedrockkv::Status::Ok();
   auto db = bedrockkv::DB::Open(dir, options, &s);
   if (db == nullptr) {

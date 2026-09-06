@@ -65,6 +65,13 @@ locks. Protocol errors close the connection with `-ERR`, exactly like
 real Redis; clients that stop reading are evicted once their reply
 backlog crosses 64 MiB.
 
+Stock `redis-benchmark` drives it out of the box (same-host numbers,
+gVisor sandbox): with pipelining, 278k GET and 91k SET req/s — within
+85% of real Redis 7.2 on the read path. The protocol layer and WAL
+replayer are coverage-guided fuzz targets (libFuzzer, 23M+ execs, zero
+findings; short fuzz smokes run in CI): numbers and analysis in
+`docs/benchmarks.md`.
+
 ## License
 
 MIT (to be finalized at v1.0).

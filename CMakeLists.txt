@@ -19,6 +19,16 @@ endif()
 # Fail the build on any warning; new code must be clean from day one.
 add_compile_options(-Wall -Wextra -Wpedantic -Werror)
 
+# ---- Fuzzing (libFuzzer, optional) ----------------------------------------
+# Requires clang (coverage instrumentation). The LIBRARY is instrumented
+# with -fsanitize=fuzzer-no-link so the fuzzer's feedback loop can see into
+# it; the fuzz executables add the fuzzer runtime in tests/fuzz/. Scope
+# matters: this must be a per-target flag — a global add_compile_options
+# would instrument gtest and every test binary too, leaving them with
+# coverage calls but no runtime to resolve them (undefined refs at link).
+# See tests/fuzz/ for the harness contracts.
+option(BEDROCKKV_FUZZ "Build libFuzzer targets (requires clang)" OFF)
+
 # ---- Dependencies (FetchContent, per design doc ch.4) -------------------
 include(FetchContent)
 FetchContent_Declare(
@@ -49,6 +59,14 @@ add_library(bedrockkv
 )
 target_include_directories(bedrockkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+if(BEDROCKKV_FUZZ)
+  target_compile_options(bedrockkv PRIVATE -fsanitize=fuzzer-no-link)
+  # Consumers of the instrumented static library (tests, the server
+  # binary) must link the sanitizer-coverage runtime too — INTERFACE so
+  # every target linking bedrockkv inherits it without repeating flags.
+  target_link_options(bedrockkv INTERFACE -fsanitize=fuzzer-no-link)
+endif()
+
 # ---- Server binary ----------------------------------------------------------
 # The demo endpoint: redis-cli / redis-benchmark connect here.
 add_executable(bedrockkv-server tools/server_main.cpp)
@@ -63,3 +81,7 @@ target_link_libraries(ycsb_bench PRIVATE bedrockkv)
 # ---- Tests ---------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests)
+
+if(BEDROCKKV_FUZZ)
+  add_subdirectory(tests/fuzz)
+endif()

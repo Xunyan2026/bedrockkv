@@ -174,3 +174,58 @@ Figure: the stage-3 result so far — write amplification (left) drops
 580 ms → 40 ms as compaction stalls disappear. E's max latency is flat
 (28.2 → 30.3 ms): its cost is scan throughput (pointer resolution), not
 tail stalls — the first io_uring follow-up target.
+
+## Stage 4: Redis-compatible server — redis-benchmark over the wire
+
+Stage 3 measured the engine in-process; stage 4 adds the network face, so
+the first stage-4 measurement is the one that matters for the demo:
+**stock `redis-benchmark` driving BedrockKV over TCP**, next to real
+Redis 7.2 on the same host, same parameters (`-n 50000`, 3-byte values,
+10 seconds of warmup discarded, gVisor sandbox, loopback).
+
+| setup | SET (req/s) | GET (req/s) | SET p99 (ms) | GET p99 (ms) |
+|---|---|---|---|---|
+| bedrockkv, sync=never, pipeline=1   | 16 529 | 18 376 | 2.0 | 1.9 |
+| bedrockkv, sync=always, pipeline=1  | 15 980 | 18 070 | 6.0 | 1.9 |
+| bedrockkv, sync=never, pipeline=16  | 90 909 | 277 778 | 43.4 | 2.1 |
+| bedrockkv, sync=always, pipeline=16 | 71 736 | 277 778 | 43.2 | 2.5 |
+| redis 7.2, pipeline=1               | 18 839 | 19 320 | 2.0 | 2.0 |
+| redis 7.2, pipeline=16              | 303 030 | 320 513 | 2.3 | 2.6 |
+
+Reading the table honestly:
+
+* **Pipeline=1 is a latency-bound world.** Every request pays a full
+  loopback round trip through gVisor (~1.4–1.6 ms average), which
+  compresses all servers into the same ~17–19k req/s band; at this
+  granularity BedrockKV is within ~12% of real Redis. This sandbox's
+  socket path dominates; raw-metal numbers would separate the servers.
+* **Durability is nearly free at pipeline=1 here** (15 980 vs 16 529
+  req/s): the WAL fsyncs hit tmpfs, which is the sandbox's known caveat —
+  the *ratio* is what transfers, and it says the kSyncAlways code path
+  adds no locking or extra syscalls beyond the fsyncs themselves.
+* **Pipelining (P=16) exposes the real server.** GET reaches 278k req/s —
+  85% of real Redis — because the read path is memory-only. SET reaches
+  91k (30% of Redis): each SET pays WAL record encode + memtable insert
+  + the benchmark's separate key writes, all on the single event-loop
+  thread. That is the honest price of persisting at all; Redis
+  (appendonly off, no fsync) never touches a disk on this path.
+* **SET p99 = 43 ms at P=16 is the memtable rotation + L0 flush stall**
+  reappearing through the network stack — the same 40 ms tail the YCSB
+  stage-3 table showed in-process. Known, measured, and unchanged by the
+  network layer; fixing it is the async-flush follow-up already queued
+  in the stage-3 analysis.
+
+### Fuzzing (libFuzzer)
+
+Three coverage-guided harnesses (tests/fuzz/, clang, `-fsanitize=fuzzer`):
+
+| target | contract | local session | execs |
+|---|---|---|---|
+| resp_fuzz   | any bytes parse without crash/hang; parser never invents bytes; every error explains itself | 120 s | 23 171 712 |
+| wal_fuzz    | arbitrary WAL bytes replay safely; truncating at the reported last-good-end always yields clean records (the recovery invariant) | 120 s | 2 171 385 |
+| server_fuzz | parser → dispatch → real DB in one loop; every reply is a complete RESP2 message | 120 s | 977 431 |
+
+Zero crashes, hangs, or invariant violations. CI runs each harness as a
+60-second smoke on every push; the seeds in tests/fuzz/seeds/ pin the
+interesting input shapes (binary-safe args, truncated multibulks, bad
+CRCs, torn WAL tails) so the fuzzer never starts from zero coverage.

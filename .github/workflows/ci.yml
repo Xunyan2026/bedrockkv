@@ -45,3 +45,30 @@ jobs:
           for i in range(0, len(text), 3000):
               print(f"::error::CI-TEST[{i//3000}]: {text[i:i+3000]}")
           PYEOF
+
+  # Short coverage-guided fuzz smokes: not a substitute for long local
+  # sessions (docs/benchmarks.md), but they catch regressions in the
+  # crash/hang/heap-abuse contracts the harnesses encode. libFuzzer exits
+  # nonzero on a crash; 60 s per target keeps the job cheap.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang
+
+      - name: Configure (fuzz build)
+        run: cmake -S . -B build-fuzz -DBEDROCKKV_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-fuzz -j
+
+      - name: Fuzz RESP parser
+        run: ./build-fuzz/tests/fuzz/resp_fuzz -max_total_time=60 -max_len=4096 -rss_limit_mb=2048 tests/fuzz/seeds/resp
+
+      - name: Fuzz WAL replayer
+        run: ./build-fuzz/tests/fuzz/wal_fuzz -max_total_time=60 -max_len=8192 -rss_limit_mb=2048 tests/fuzz/seeds/wal
+
+      - name: Fuzz server stack (parser + dispatch + DB)
+        run: ./build-fuzz/tests/fuzz/server_fuzz -max_total_time=60 -max_len=4096 -rss_limit_mb=2048 tests/fuzz/seeds/resp
