@@ -39,8 +39,12 @@ std::unique_ptr<Ring> Ring::Open(unsigned entries, Status* status) {
   auto ring = std::unique_ptr<Ring>(new Ring());
   ring->fd_ = fd;
   ring->entries_ = entries;
-  ring->sq_mask_ = params.sq_off.ring_mask;
-  ring->cq_mask_ = params.cq_off.ring_mask;
+  // CAUTION: params.sq_off.* / params.cq_off.* are BYTE OFFSETS of the
+  // control fields WITHIN the ring mappings — not their values. The mask
+  // values themselves live in ring memory at those offsets and must be
+  // read AFTER the mmaps below (using the offset as the mask made every
+  // index collapse onto slot 0: batched SQEs overwrote each other and
+  // CQEs were re-read from slot 0 — only visible on io_uring hosts).
   ring->cq_off_ = CqOffsets{params.cq_off.head, params.cq_off.tail,
                             params.cq_off.ring_mask,
                             params.cq_off.ring_entries,
@@ -85,6 +89,13 @@ std::unique_ptr<Ring> Ring::Open(unsigned entries, Status* status) {
   ring->cq_head_ = reinterpret_cast<uint32_t*>(cq_ring + params.cq_off.head);
   ring->cq_tail_ = reinterpret_cast<volatile uint32_t*>(cq_ring +
                                                         params.cq_off.tail);
+  // The actual mask values, read from ring memory at the offsets the
+  // kernel reported (see the CAUTION above). The kernel writes these at
+  // setup and they never change afterwards.
+  ring->sq_mask_ = *reinterpret_cast<volatile uint32_t*>(
+      reinterpret_cast<char*>(ring->sq_ring_) + params.sq_off.ring_mask);
+  ring->cq_mask_ =
+      *reinterpret_cast<volatile uint32_t*>(cq_ring + params.cq_off.ring_mask);
   return ring;
 }
 

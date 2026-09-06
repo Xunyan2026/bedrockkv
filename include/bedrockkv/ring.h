@@ -163,6 +163,9 @@ class Ring {
   // Into the CQ ring: kernel-written tail, our consumed head, CQE array.
   volatile uint32_t* cq_tail_ = nullptr;
   uint32_t* cq_head_ = nullptr;
+  // Ring-index masks. NOT from io_uring_params — params carry the byte
+  // OFFSET of the mask field; the mask VALUES live in ring memory at
+  // those offsets and are read after the mmaps (see Ring::Open).
   uint32_t sq_mask_ = 0, cq_mask_ = 0;
   CqOffsets cq_off_{};
 };
