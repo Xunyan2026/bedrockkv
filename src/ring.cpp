@@ -48,13 +48,16 @@ std::unique_ptr<Ring> Ring::Open(unsigned entries, Status* status) {
                             params.cq_off.cqes};
 
   // The SQ ring region holds: the index array at sq_off.array, preceded by
-  // the control fields. Size it from the kernel-provided offsets — the
-  // layout changed once historically (5.4 vs 5.5) and must not be guessed.
-  ring->sq_ring_size_ = params.sq_off.array + entries * sizeof(uint32_t);
+  // the control fields. Size everything from the KERNEL-REPORTED counts —
+  // the kernel may round `entries` up and by default DOUBLES the CQ ring
+  // (cq_entries = 2 * sq_entries); sizing from the request would mmap too
+  // little and fault on the first CQEs past the mapping.
+  ring->sq_ring_size_ =
+      params.sq_off.array + params.sq_entries * sizeof(uint32_t);
   ring->sq_ring_ = ::mmap(nullptr, ring->sq_ring_size_,
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           fd, static_cast<off_t>(kOffSqRing));
-  ring->cq_ring_size_ = params.cq_off.cqes + entries * sizeof(Cqe);
+  ring->cq_ring_size_ = params.cq_off.cqes + params.cq_entries * sizeof(Cqe);
   ring->cq_ring_ = ::mmap(nullptr, ring->cq_ring_size_,
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           fd, static_cast<off_t>(kOffCqRing));
@@ -163,6 +166,7 @@ bool Ring::Flush(bool wait_all) {
   if (rc < 0) {
     return false;
   }
+  outstanding_ += to_submit;  // submitted, awaiting reap (Reap decrements)
   return true;
 }
 

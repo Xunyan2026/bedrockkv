@@ -100,7 +100,9 @@ class Ring {
           reinterpret_cast<const char*>(cq_ring_) + cq_off_.cqes +
           (head & cq_mask_) * sizeof(Cqe));
       *cq_head_ = head + 1;  // publish the slot as consumed
-      --outstanding_;
+      if (outstanding_ > 0) {
+        --outstanding_;  // belt-and-braces: never let this underflow
+      }
       fn(cqe->user_data, cqe->res);
     }
     return true;
