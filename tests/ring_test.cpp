@@ -12,6 +12,8 @@
 
 #include <sys/utsname.h>
 
+#include <linux/io_uring.h>
+
 #include <gtest/gtest.h>
 
 #include "bedrockkv/ring.h"
@@ -218,6 +220,119 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
 
   ::close(fd);
   ::unlink(path.c_str());
+}
+
+// TEMPORARY CI-only diagnostic v2 (gVisor has no io_uring): bypass the
+// Ring class entirely — raw syscalls + mmaps — and dump the raw ring
+// memory so the CQE placement question is answered with bytes, not
+// theories. Remove once root-caused.
+TEST(RingTest, DIAGNOSTIC_RawRingDump) {
+  utsname u{};
+  uname(&u);
+  std::printf("DIAG2 uname: %s %s\n", u.sysname, u.release);
+
+  io_uring_params params;
+  std::memset(&params, 0, sizeof(params));
+  const int rfd =
+      static_cast<int>(::syscall(425, 8, &params));  // io_uring_setup
+  ASSERT_GE(rfd, 0);
+  std::printf(
+      "DIAG2 sq_entries=%u cq_entries=%u | sq_off: head=%u tail=%u mask=%u "
+      "entries=%u flags=%u dropped=%u array=%u | cq_off: head=%u tail=%u "
+      "mask=%u entries=%u overflow=%u cqes=%u\n",
+      params.sq_entries, params.cq_entries, params.sq_off.head,
+      params.sq_off.tail, params.sq_off.ring_mask, params.sq_off.ring_entries,
+      params.sq_off.flags, params.sq_off.dropped, params.sq_off.array,
+      params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask,
+      params.cq_off.ring_entries, params.cq_off.overflow, params.cq_off.cqes);
+
+  const size_t sq_sz = params.sq_off.array + params.sq_entries * 4;
+  const size_t cq_sz = params.cq_off.cqes + params.cq_entries * 16;
+  auto* sq = static_cast<std::byte*>(
+      ::mmap(nullptr, sq_sz, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_POPULATE, rfd, 0));
+  auto* cq = static_cast<std::byte*>(
+      ::mmap(nullptr, cq_sz, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_POPULATE, rfd, 0x8000000));
+  auto* sqes = static_cast<std::byte*>(
+      ::mmap(nullptr, params.sq_entries * 64, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_POPULATE, rfd, 0x10000000));
+  ASSERT_NE(sq, MAP_FAILED);
+  ASSERT_NE(cq, MAP_FAILED);
+  ASSERT_NE(sqes, MAP_FAILED);
+  std::printf("DIAG2 sq_sz=%zu cq_sz=%zu same_pages=%d\n", sq_sz, cq_sz,
+              sq == cq ? 1 : 0);
+
+  auto dump = [](const char* tag, const std::byte* p, size_t n) {
+    std::printf("DIAG2 %s:", tag);
+    for (size_t i = 0; i < n; ++i) {
+      if (i % 16 == 0) {
+        std::printf("\n  [%3zu]", i);
+      }
+      std::printf(" %02x", static_cast<unsigned>(p[i]));
+    }
+    std::printf("\n");
+  };
+
+  auto head_of = [&](const std::byte* base, uint32_t off) {
+    uint32_t v;
+    std::memcpy(&v, base + off, 4);
+    return v;
+  };
+
+  const std::string path = TempPath("diag2");
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  ASSERT_GE(fd, 0);
+
+  // One flush, two writes: the failing shape.
+  const std::string c = "CCCCCCCCCC";
+  const std::string d = "DDDDDDDDDD";
+  for (int i = 0; i < 2; ++i) {
+    auto* sqe = sqes + i * 64;
+    std::memset(sqe, 0, 64);
+    sqe[0] = static_cast<std::byte>(23);  // IORING_OP_WRITE
+    int32_t f = fd;
+    uint64_t off = i == 0 ? 0 : 10;
+    uint64_t addr =
+        reinterpret_cast<uint64_t>(i == 0 ? c.data() : d.data());
+    uint32_t len = 10;
+    uint64_t ud = i == 0 ? 100 : 200;
+    std::memcpy(sqe + 4, &f, 4);
+    std::memcpy(sqe + 8, &off, 8);
+    std::memcpy(sqe + 16, &addr, 8);
+    std::memcpy(sqe + 24, &len, 4);
+    std::memcpy(sqe + 32, &ud, 8);
+    uint32_t idx = static_cast<uint32_t>(i);
+    std::memcpy(sq + params.sq_off.array + 4 * i, &idx, 4);
+  }
+  uint32_t tail = 2;
+  std::memcpy(sq + params.sq_off.tail, &tail, 4);
+  std::printf("DIAG2 pre-enter: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
+              head_of(sq, params.sq_off.head), head_of(sq, params.sq_off.tail),
+              head_of(cq, params.cq_off.head), head_of(cq, params.cq_off.tail));
+  dump("sqes[0..1]", sqes, 128);
+  const long rc = ::syscall(426, rfd, 2, 2, 1, nullptr, 0);  // enter, wait 2
+  std::printf("DIAG2 enter rc=%ld errno=%d\n", rc, rc < 0 ? errno : 0);
+  std::printf("DIAG2 post-enter: sq_head=%u cq_tail=%u\n",
+              head_of(sq, params.sq_off.head), head_of(cq, params.cq_off.tail));
+  dump("cq[0..cqesz]", cq, cq_sz < 256 ? cq_sz : 256);
+
+  char fbuf[32];
+  std::memset(fbuf, 0, sizeof(fbuf));
+  const ssize_t got = ::pread(fd, fbuf, sizeof(fbuf), 0);
+  std::printf("DIAG2 file pread=%zd bytes=", got);
+  for (char ch : fbuf) {
+    if (ch >= 32 && ch < 127) {
+      std::putchar(ch);
+    } else {
+      std::printf("<%02x>", static_cast<unsigned char>(ch));
+    }
+  }
+  std::printf("\n");
+
+  ::close(fd);
+  ::unlink(path.c_str());
+  ::close(rfd);
 }
 
 }  // namespace
