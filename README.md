@@ -9,8 +9,9 @@ Redis-compatible wire server. Zero third-party dependencies.**
 Built from scratch: the WAL format, skiplist, SSTable layout, Bloom
 filters, compaction picker, MVCC visibility rules, the io_uring ring
 (raw syscalls), and the RESP2 protocol parser are all hand-written —
-the only dependency is GoogleTest, for the 102 tests that pin it all
-down (Release + ASan/UBSan + TSan, plus libFuzzer targets in CI).
+the only dependency is GoogleTest, for the 106 tests that pin it all
+down (ASan/UBSan builds run in CI; TSan and long fuzz sessions run
+locally before every push).
 
 ## The headline numbers
 
@@ -49,26 +50,27 @@ $ redis-cli -p 7379 get greeting          # survived the restart
 
 ```mermaid
 flowchart TB
-    subgraph clients [" "]
-        RC[redis-cli / redis-benchmark]
-    end
+    RC["redis-cli / redis-benchmark"]
     subgraph server ["bedrockkv-server — 1 event-loop thread (epoll LT)"]
         RESP["RESP2 parser<br/>SET GET DEL EXISTS PING ECHO"]
     end
     subgraph engine ["DB — 1 writer + N lock-free readers + 1 background thread"]
         direction TB
-        W[Put / Delete] --> WAL[WAL<br/>32 KiB chunks · CRC · torn-tail truncation]
-        WAL --> MEM[MemTable<br/>skiplist · tag = seq&#8858;8 + type]
-        MEM -- "rotate at 4 MiB" --> IMM[immutable memtable]
-        IMM -- "background flush" --> L0[L0 SSTs<br/>(overlapping, newest first)]
-        L0 -- "size-tiered" --> L1[L1..L6 SSTs<br/>leveled compaction]
-        VLOG[vLog<br/>append-only values ≥ 1 KiB<br/>+ full-rewrite GC]
+        W["Put / Delete"] --> WAL["WAL<br/>32 KiB chunks · CRC · torn-tail truncation"]
+        MEM -- "rotate at 4 MiB" --> IMM["immutable memtable"]
+        WAL --> MEM["MemTable<br/>skiplist · tag = (seq&lt;&lt;8) | type"]
+        IMM -- "background flush" --> L0["L0 SSTs<br/>overlapping, newest first"]
+        L0 -- "size-tiered" --> L1["L1..L6 SSTs<br/>leveled compaction"]
+        VLOG["vLog<br/>append-only values >= 1 KiB<br/>+ full-rewrite GC"]
         MAN[("MANIFEST<br/>SST list · live vLogs · replay floor")]
         SNAP["MVCC snapshots<br/>read at any past sequence"]
+        W -. "values >= threshold" .-> VLOG
+        IMM & L0 -. "publish (tmp+rename+fsync)" .-> MAN
     end
     RC --> RESP --> W
-    RESP --> R[Get / Scan] --> MEM & L0 & L1
+    RESP --> R["Get / Scan"] --> MEM & L0 & L1
     R -- "21-byte pointer" --> VLOG
+    SNAP -. "pin a sequence" .-> R
 ```
 
 - **Internal key** `[klen][user_key][tag=(seq<<8)|type][value]`, sorted
@@ -96,7 +98,7 @@ git clone git@github.com:Xunyan2026/bedrockkv.git
 cd bedrockkv
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure      # 102 tests
+ctest --test-dir build --output-on-failure      # 106 tests
 ```
 
 Requirements: Linux, CMake ≥ 3.16, a C++20 compiler (GCC ≥ 11 /
@@ -120,7 +122,7 @@ Run the YCSB harness (reproduces every number in docs/benchmarks.md):
 
 ## Quality posture
 
-- **102 gtest tests** across three sanitizer builds (ASan/UBSan, TSan),
+- **106 gtest tests** across three sanitizer builds (ASan/UBSan, TSan),
   `-Werror`, zero warnings; randomized model tests against `std::map`
   shadows that deliberately cross flush/compaction boundaries; crash
   tests with real `kill -9`.

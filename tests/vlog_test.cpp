@@ -231,9 +231,9 @@ TEST(VLogTest, ScanEntriesSeesEveryEntryWithOffsets) {
 // ---- sharded LRU cache ----
 
 TEST(LruCacheTest, PutGetEvictsLeastRecent) {
-  // 4 shards, total weight 10, weight = value length.
+  // 4 shards, total weight 40 (10 per shard), weight = value length.
   ShardedLruCache<std::string, std::string, std::hash<std::string>> cache(
-      4, 10, [](const std::string& v) { return v.size(); });
+      4, 40, [](const std::string& v) { return v.size(); });
   std::string out;
   EXPECT_FALSE(cache.Get("a", &out));
 
@@ -271,6 +271,29 @@ TEST(LruCacheTest, OversizedEntryIsNotCached) {
   cache.Put(1, "too-big-entry");
   std::string out;
   EXPECT_FALSE(cache.Get(1, &out));
+}
+
+TEST(LruCacheTest, ShardsShareTheTotalBudget) {
+  // Regression: every shard used to evict against the TOTAL budget, so
+  // N shards could each hold max_total_weight — 4 shards meant 4x the
+  // memory the caller asked for. Weight = value length.
+  ShardedLruCache<std::string, std::string, std::hash<std::string>> cache(
+      4, 40, [](const std::string& v) { return v.size(); });  // 10 per shard
+  for (int i = 0; i < 40; ++i) {
+    cache.Put("key" + std::to_string(i), std::string(8, 'x'));
+  }
+  std::string out;
+  int hits = 0;
+  for (int i = 0; i < 40; ++i) {
+    if (cache.Get("key" + std::to_string(i), &out)) {
+      ++hits;
+    }
+  }
+  // A shard's share is 10, so it retains at most ONE 8-byte entry (a
+  // second would push its weight to 16); four shards retain at most 4
+  // no matter how the hash distributes the keys. The old behavior kept
+  // about 20.
+  EXPECT_LE(hits, 8);
 }
 
 }  // namespace

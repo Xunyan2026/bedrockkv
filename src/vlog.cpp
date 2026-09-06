@@ -95,6 +95,17 @@ Status VLog::Append(std::string_view key, std::string_view value,
       if (errno == EINTR) {
         continue;
       }
+      // O_APPEND always writes at the physical EOF. A failed write may
+      // have written PARTIAL bytes first (ENOSPC mid-entry): the file
+      // has grown past what end_ records, while end_ stays behind.
+      // Every later Append would hand out pointers computed from the
+      // stale end_ — pointing at the wrong bytes. Re-derive end_ from
+      // the file before reporting the error.
+      const off_t real_end = ::lseek(fd_, 0, SEEK_END);
+      if (real_end >= 0) {
+        end_.store(static_cast<uint64_t>(real_end),
+                   std::memory_order_relaxed);
+      }
       return Status::IOError("vlog append failed: " +
                              std::string(std::strerror(errno)));
     }
@@ -126,11 +137,16 @@ Status VLog::ReadValue(uint64_t offset, uint32_t expected_size,
   }
   const uint32_t klen = GetFixed32(header + 4);
   const uint32_t vsize = GetFixed32(header + 8);
+  // 64-bit arithmetic: klen and vsize are attacker-reconstructible
+  // garbage from a torn tail, and a u32 klen+vsize can wrap past the
+  // range check below and turn the payload allocation/pread into an
+  // out-of-bounds read. Promote before adding.
+  const uint64_t payload_size = static_cast<uint64_t>(klen) + vsize;
   // Range check FIRST: a torn tail's garbage header would otherwise be
   // reported as a size mismatch (corruption) when it is really just an
   // entry that was never fully written (bounded loss).
   if (klen > end || vsize > end ||
-      klen + vsize > end - offset - kEntryHeaderSize) {
+      payload_size > end - offset - kEntryHeaderSize) {
     return Status::NotFound("torn vlog tail in " + FileName(number_));
   }
   if (vsize != expected_size) {
@@ -138,7 +154,7 @@ Status VLog::ReadValue(uint64_t offset, uint32_t expected_size,
                               " != pointer size " +
                               std::to_string(expected_size));
   }
-  std::string payload(klen + vsize, '\0');
+  std::string payload(payload_size, '\0');
   n = ::pread(fd_, payload.data(), payload.size(),
               static_cast<off_t>(offset + kEntryHeaderSize));
   if (n < 0 || static_cast<size_t>(n) < payload.size()) {

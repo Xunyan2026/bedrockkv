@@ -12,13 +12,16 @@ never touches value bytes — that is the entire write-amplification win.
 
 `offset` points at the vLog entry start. The 0xFF tag makes a pointer
 recognizable: a slot is a pointer iff it is exactly 21 bytes and starts
-with 0xFF. Known limitation (documented, accepted for this project): a
-user value that is itself 21 bytes and starts with 0xFF would be
-misresolved while separation is enabled. The Open-time clamp of the
-threshold to >= 64 keeps *newly written* small values from being
-separated, but cannot distinguish such a value in already-stored data.
-RocksDB's approach (a per-value metadata byte) costs a byte on every
-inline value and is the production-grade fix if this ever matters. Pointers are opaque bytes everywhere
+with 0xFF. A user value of exactly that shape would collide with this
+scheme; the engine now prevents the ambiguity on BOTH paths (formerly a
+documented accepted limitation): while separation is enabled, a
+pointer-shaped value is separated into the vLog even below the
+threshold, so an inline slot is always either a real value or a real
+pointer; with separation disabled the read path never decodes pointers
+at all. (Historical data written before this fix is unaffected by the
+Open-time threshold clamp of >= 64 only for *new* writes; RocksDB's
+approach — a per-value metadata byte — remains the production-grade
+scheme.) Pointers are opaque bytes everywhere
 below the DB layer — memtables, SSTs, iterators, compaction treat them like
 any other value and must never rewrite them.
 

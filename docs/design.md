@@ -345,7 +345,7 @@ pick one or defer materialization with offsets.**
 
 ## Fuzzing and testing posture
 
-- **102 gtest tests** across three builds (Release, ASan/UBSan, TSan),
+- **106 gtest tests** across three builds (Release, ASan/UBSan, TSan),
   `-Wall -Wextra -Wpedantic -Werror`, zero warnings. Concurrency tests
   re-run under TSan repeatedly (flaky interleave hunting).
 - **Model tests**: engine vs `std::map` shadow over randomized op

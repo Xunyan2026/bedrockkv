@@ -19,6 +19,17 @@ endif()
 # Fail the build on any warning; new code must be clean from day one.
 add_compile_options(-Wall -Wextra -Wpedantic -Werror)
 
+# ---- Sanitizers (optional) -------------------------------------------------
+# -DSANITIZE=address | thread | address,undefined. Must be GLOBAL: a
+# sanitizer runtime is linked per binary, so the test executables need the
+# flags exactly as much as the library does. -fno-omit-frame-pointer keeps
+# sanitizer stack traces readable.
+set(SANITIZE "" CACHE STRING "Sanitizers to enable, e.g. address,undefined")
+if(SANITIZE)
+  add_compile_options(-fsanitize=${SANITIZE} -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=${SANITIZE})
+endif()
+
 # ---- Fuzzing (libFuzzer, optional) ----------------------------------------
 # Requires clang (coverage instrumentation). The LIBRARY is instrumented
 # with -fsanitize=fuzzer-no-link so the fuzzer's feedback loop can see into

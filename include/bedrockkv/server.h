@@ -80,6 +80,7 @@ class RedisServer {
   void CloseConn(int fd);
 
   static constexpr size_t kMaxOutBytes = 64u << 20;   // reply backlog cap
+  static constexpr size_t kMaxInBytes = 64u << 20;    // unread input cap
   static constexpr size_t kMaxConns = 4096;
 
   DB* db_ = nullptr;
@@ -92,9 +93,13 @@ class RedisServer {
 
   // One state machine per connection. Read buffer lives inside the
   // parser; out accumulates replies until the socket takes them all.
+  // out_off_ is the write cursor into out — replying in place and
+  // compacting once per full flush keeps a 64 MiB backlog O(n) instead
+  // of erasing the prefix after every write (O(n^2) memmoves).
   struct Conn {
     resp::Parser parser;
     std::string out;
+    size_t out_off_ = 0;
     bool closing = false;  // protocol error: flush pending reply, then die
   };
   std::map<int, Conn> conns_;  // loop thread only

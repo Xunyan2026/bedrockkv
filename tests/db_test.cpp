@@ -1256,4 +1256,94 @@ TEST(DBTest, VlogGcDeferredWhileSnapshotAlive) {
   }
 }
 
+TEST(DBTest, CompactionNeverSplitsInsideAUserKey) {
+  // Regression: with a snapshot pinning several versions of one key,
+  // the output-size split used to fire mid-version-run and produce
+  // same-level files with IDENTICAL key ranges — the L1+ binary search
+  // then saw only the oldest chunk (stale reads, resurrected deletes,
+  // snapshot versions reported missing).
+  const std::string dir = FreshDBDir("db_snap_split");
+  Options opts;
+  opts.sync_mode = SyncMode::kSyncNever;
+  opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 64 * 1024;
+  opts.max_sst_size = 16 * 1024;  // tiny: force output splits
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  ASSERT_TRUE(db->Put("hot", "BEFORE").ok());
+  Snapshot* snap = db->GetSnapshot();
+  // 100 x 2 KiB overwrites of ONE key: ~200 KiB of versions above the
+  // snapshot floor, far past max_sst_size.
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(
+        db->Put("hot", "V" + std::to_string(i) + std::string(2048, 'x'))
+            .ok());
+  }
+  for (int i = 0; i < 30; ++i) {  // filler to drive flush + compaction
+    ASSERT_TRUE(
+        db->Put("fill" + std::to_string(i), std::string(1500, 'y')).ok());
+  }
+  db->wait_for_background_work();
+
+  std::string v;
+  ASSERT_TRUE(db->Get("hot", &v).ok());
+  EXPECT_EQ(v.substr(0, 6), "V99xxx") << "stale chunk won the read";
+  ASSERT_TRUE(db->Get("hot", &v, snap).ok())
+      << "snapshot lost its at-or-below-floor version";
+  EXPECT_EQ(v, "BEFORE");
+
+  // A tombstone on top must also win over every retained version.
+  ASSERT_TRUE(db->Delete("hot").ok());
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(
+        db->Put("fill" + std::to_string(i), std::string(1500, 'z')).ok());
+  }
+  db->wait_for_background_work();
+  EXPECT_FALSE(db->Get("hot", &v).ok()) << "deleted key resurrected";
+
+  db->ReleaseSnapshot(snap);
+}
+
+TEST(DBTest, BinaryValuesThatLookLikePointers) {
+  // Regression: a 21-byte value starting with 0xFF used to be decoded
+  // as a vLog pointer on the read path (spurious Corruption or wrong
+  // bytes), with separation on OR off.
+  const std::string evil21 = std::string("\xff", 1) + std::string(20, '\x01');
+  const std::string evil25 = std::string("\xff", 1) + std::string(24, '\x02');
+  {
+    // Separation OFF: this DB has no pointers at all — every byte is
+    // user data.
+    auto db = DB::Open(FreshDBDir("db_ptrshape_off"));
+    ASSERT_NE(db, nullptr);
+    ASSERT_TRUE(db->Put("a", evil21).ok());
+    ASSERT_TRUE(db->Put("b", evil25).ok());
+    std::string v;
+    ASSERT_TRUE(db->Get("a", &v).ok());
+    EXPECT_EQ(v, evil21);
+    ASSERT_TRUE(db->Get("b", &v).ok());
+    EXPECT_EQ(v, evil25);
+  }
+  {
+    // Separation ON: pointer-shaped values are separated even below the
+    // threshold, so an inline slot is never ambiguous — and they must
+    // survive flush + reopen as pointer reads from the SST.
+    const std::string dir = FreshDBDir("db_ptrshape_on");
+    Options opts = SeparationOptions(64u << 20);
+    opts.value_separation_threshold = 64;
+    auto db = DB::Open(dir, opts);
+    ASSERT_NE(db, nullptr);
+    ASSERT_TRUE(db->Put("a", evil21).ok());
+    std::string v;
+    ASSERT_TRUE(db->Get("a", &v).ok());
+    EXPECT_EQ(v, evil21);
+    db.reset();
+    db = DB::Open(dir, opts);
+    ASSERT_NE(db, nullptr);
+    ASSERT_TRUE(db->Get("a", &v).ok());
+    EXPECT_EQ(v, evil21);
+  }
+}
+
 }  // namespace

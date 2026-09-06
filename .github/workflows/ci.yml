@@ -46,6 +46,25 @@ jobs:
               print(f"::error::CI-TEST[{i//3000}]: {text[i:i+3000]}")
           PYEOF
 
+  # ASan + UBSan: the memory/UB safety net the regular builds lack.
+  # -fno-sanitize-recover=all makes the first violation fail the test
+  # instead of printing and continuing. TSan runs are part of the local
+  # pre-push loop (see docs/design.md) — CI keeps one sanitizer job for
+  # cost and runtime.
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=address,undefined -DCMAKE_CXX_FLAGS="-fno-sanitize-recover=all"
+
+      - name: Build
+        run: cmake --build build-san -j
+
+      - name: Test
+        run: ctest --test-dir build-san --output-on-failure
+
   # Short coverage-guided fuzz smokes: not a substitute for long local
   # sessions (docs/benchmarks.md), but they catch regressions in the
   # crash/hang/heap-abuse contracts the harnesses encode. libFuzzer exits

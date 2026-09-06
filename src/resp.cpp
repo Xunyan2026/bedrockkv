@@ -67,8 +67,9 @@ NextStatus Parser::Next(std::vector<std::string>* args,
           return NextStatus::kError;
         }
         if (n <= 0) {
-          // *0 / *-1: nothing to execute — consume and look at the next
-          // request (Redis treats these as empty commands too).
+          // *0: an empty command — nothing to execute; consume it and
+          // look at the next request (Redis treats it the same way).
+          // (*-1 never reaches here: ParseDigits rejects a leading '-'.)
           buf_.erase(0, nl + 2);
           parse_pos_ = 0;
           continue;

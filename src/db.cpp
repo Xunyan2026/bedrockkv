@@ -662,7 +662,16 @@ Status DB::WriteEntry(uint8_t type, std::string_view key,
   // the WAL) are harmless — GC reclaims them.
   std::string_view stored = value;
   std::string pointer;
-  if (type == kTypeValue && vsep_enabled_ && value.size() >= vsep_threshold_) {
+  // A value that IS the pointer shape (21 bytes starting 0xFF) must never
+  // stay inline while separation is on: the read path would decode it as
+  // a pointer into a vLog it was never written to. Such values are
+  // separated even below the threshold — after this, every inline slot
+  // is either a real value or a real pointer, never an ambiguity.
+  const bool pointer_shaped = value.size() == kValuePointerSize &&
+                              value.size() > 0 &&
+                              value[0] == kValuePointerTag;
+  if (type == kTypeValue && vsep_enabled_ &&
+      (value.size() >= vsep_threshold_ || pointer_shaped)) {
     uint64_t offset = 0;
     uint64_t entry_bytes = 0;
     const Status s = vlog_current_->Append(key, value, &offset, &entry_bytes);
@@ -1258,13 +1267,20 @@ Snapshot* DB::GetSnapshot() {
 }
 
 void DB::ReleaseSnapshot(Snapshot* snapshot) {
-  std::lock_guard<std::mutex> lk(mutex_);
-  for (auto it = snapshots_.begin(); it != snapshots_.end(); ++it) {
-    if (it->get() == snapshot) {
-      snapshots_.erase(it);
-      return;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (auto it = snapshots_.begin(); it != snapshots_.end(); ++it) {
+      if (it->get() == snapshot) {
+        snapshots_.erase(it);
+        break;
+      }
     }
   }
+  // Releasing the LAST snapshot re-arms compaction and the vLog GC (both
+  // gate on live snapshots), but nothing else about the release touches
+  // the background thread's wakeup sources — without this notify, an
+  // otherwise-idle DB could leave reclamation deferred indefinitely.
+  signal_.notify_all();
 }
 
 uint64_t DB::SmallestSnapshotSeq() const {
@@ -1280,9 +1296,15 @@ uint64_t DB::SmallestSnapshotSeq() const {
 // ---- value separation: pointer resolution + GC ----
 
 Status DB::MaybeResolvePointer(std::string* value) const {
-  // Inline values (separation off, or below the threshold) pass through
-  // untouched: anything that is not exactly the 21-byte 0xFF-tagged
-  // pointer shape cannot be a pointer.
+  // Separation never enabled: this DB contains no pointers at all, so
+  // even a value that looks like one (21 bytes starting 0xFF) is real
+  // user bytes and must pass through untouched.
+  if (!vsep_enabled_) {
+    return Status::Ok();
+  }
+  // Inline values (below the threshold; pointer-shaped ones are escaped
+  // at write time) pass through untouched: anything that is not exactly
+  // the 21-byte 0xFF-tagged pointer shape cannot be a pointer.
   if (value->size() != kValuePointerSize ||
       (*value)[0] != kValuePointerTag) {
     return Status::Ok();
@@ -1826,6 +1848,19 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
     const std::string_view ik = iter.key();
     const std::string_view user = ExtractUserKey(ik);
     if (!has_user || user != current_user) {
+      // Split output files ONLY at user-key boundaries, i.e. before the
+      // first kept version of a NEW key. Splitting inside a key's version
+      // run (possible now that snapshot retention keeps several versions
+      // of one key) would produce multiple same-level files with the
+      // same key range and break the one-file-per-range assumption the
+      // L1+ binary-search read path relies on.
+      if (has_user && builder_used &&
+          builder.ApproximateFileSize() >= options_.max_sst_size) {
+        seal();
+        if (!s.ok()) {
+          break;
+        }
+      }
       has_user = true;
       current_user.assign(user);
       floor_version_seen = false;
@@ -1844,13 +1879,6 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
       keep = false;  // older than any reader can reach
     }
     if (keep) {
-      if (builder_used &&
-          builder.ApproximateFileSize() >= options_.max_sst_size) {
-        seal();  // split between user keys, never inside one
-        if (!s.ok()) {
-          break;
-        }
-      }
       s = builder.Add(user, tag >> 8, type, iter.value());
       builder_used = true;
     }

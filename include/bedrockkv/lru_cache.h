@@ -35,6 +35,14 @@ class ShardedLruCache {
 
   ShardedLruCache(size_t shards, size_t max_total_weight, WeightFn weight)
       : shards_(shards), max_total_weight_(max_total_weight), weight_(std::move(weight)) {
+    // Per-shard budget: each shard must evict against ITS SHARE of the
+    // total, not the total itself — otherwise N shards each hold up to
+    // the full budget (N× what the caller asked for). Floor at 1 so a
+    // tiny budget still caches something in every shard.
+    shard_weight_cap_ = max_total_weight / shards;
+    if (shard_weight_cap_ == 0) {
+      shard_weight_cap_ = 1;
+    }
     shard_.reserve(shards);
     for (size_t i = 0; i < shards; ++i) {
       shard_.emplace_back(std::make_unique<Shard>());
@@ -78,7 +86,7 @@ class ShardedLruCache {
       s.map[key] = s.lru.begin();
       s.weight += w;
     }
-    while (s.weight > max_total_weight_ && !s.lru.empty()) {
+    while (s.weight > shard_weight_cap_ && !s.lru.empty()) {
       const auto victim = std::prev(s.lru.end());
       s.weight -= weight_(victim->second);
       s.map.erase(victim->first);
@@ -107,7 +115,8 @@ class ShardedLruCache {
 
   std::vector<std::unique_ptr<Shard>> shard_;
   size_t shards_;
-  size_t max_total_weight_;
+  size_t max_total_weight_;    // the whole cache's budget
+  size_t shard_weight_cap_;    // one shard's share of it
   WeightFn weight_;
 };
 

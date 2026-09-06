@@ -132,7 +132,10 @@ class Ring {
       // overwrite this slot with a new completion at any time.
       const uint64_t ud = cqe->user_data;
       const int32_t res = cqe->res;
-      *cq_head_ = head + 1;  // publish the slot as consumed
+      // Release: the slot is consumed only after its fields have been
+      // read. (liburing issues a write barrier here for weakly-ordered
+      // architectures; on x86 this compiles to a plain store.)
+      __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
       if (outstanding_ > 0) {
         --outstanding_;  // belt-and-braces: never let this underflow
       }

@@ -36,7 +36,19 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (arg == "--port") {
-      port = static_cast<uint16_t>(std::stoi(next("--port")));
+      const std::string raw = next("--port");
+      int parsed = 0;
+      try {
+        parsed = std::stoi(raw);
+      } catch (const std::exception&) {
+        std::fprintf(stderr, "invalid --port '%s'\n", raw.c_str());
+        return 2;
+      }
+      if (parsed < 0 || parsed > 65535) {
+        std::fprintf(stderr, "port out of range: %d\n", parsed);
+        return 2;
+      }
+      port = static_cast<uint16_t>(parsed);
     } else if (arg == "--dir") {
       dir = next("--dir");
     } else if (arg == "--value-separation") {

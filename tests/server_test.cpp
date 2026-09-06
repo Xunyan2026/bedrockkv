@@ -315,3 +315,33 @@ TEST(ServerTest, LargeValueRoundTrip) {
   ::close(fd);
   StopServer(&h);
 }
+
+TEST(ServerTest, OversizedPendingInputIsDropped) {
+  // Regression: an unfinished multibulk streams bytes into the parser
+  // buffer with no ceiling (the parser cannot compact a request it has
+  // not finished), so one connection could pin kMaxBulkLen of memory.
+  // Past kMaxInBytes the server must drop the connection.
+  auto h = StartServer("flood");
+  const int fd = Connect(h.server->port());
+  ASSERT_GE(fd, 0);
+
+  // Declare a ~954 MiB bulk and keep streaming body bytes: the server
+  // must close on us somewhere past 64 MiB, well before 954 MiB.
+  std::string chunk(64 * 1024, 'a');
+  const std::string head = "*1\r\n$999999999\r\n";
+  bool closed = false;
+  for (int i = 0; i < 1100; ++i) {  // up to ~72 MiB sent
+    if (i == 0 && ::write(fd, head.data(), head.size()) < 0) {
+      closed = true;  // server already gone
+      break;
+    }
+    const ssize_t n = ::write(fd, chunk.data(), chunk.size());
+    if (n < 0) {
+      closed = (errno == EPIPE || errno == ECONNRESET);
+      break;
+    }
+  }
+  EXPECT_TRUE(closed) << "server accepted > 64 MiB of pending input";
+  ::close(fd);
+  StopServer(&h);
+}

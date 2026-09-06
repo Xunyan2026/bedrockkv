@@ -327,6 +327,16 @@ bool RedisServer::HandleReadable(int fd) {
       return false;  // peer closed
     }
     conn.parser.Feed(std::string_view(buf, static_cast<size_t>(n)));
+    if (conn.parser.pending() > kMaxInBytes) {
+      // Unread-input cap: a half-issued multibulk streams bytes forever
+      // (the parser cannot compact a request it has not finished), so
+      // without a ceiling N connections pin kMaxBulkLen each —
+      // attacker-chosen memory. Redis hard-limits its query buffer the
+      // same way and drops the client. closing with an empty out means
+      // FlushOut below returns false: immediate, silent teardown.
+      conn.closing = true;
+      break;
+    }
 
     // Drain every complete request this chunk completed (pipelining:
     // redis-benchmark sends many commands per packet; replying per
@@ -345,7 +355,7 @@ bool RedisServer::HandleReadable(int fd) {
         break;
       }
       conn.out += Execute(args, db_);
-      if (conn.out.size() > kMaxOutBytes) {
+      if (conn.out.size() - conn.out_off_ > kMaxOutBytes) {
         // The peer stopped reading: shed it before its backlog eats us.
         conn.closing = true;
         break;
@@ -354,7 +364,7 @@ bool RedisServer::HandleReadable(int fd) {
     if (conn.closing) {
       break;
     }
-    if (conn.out.size() > kMaxOutBytes / 2) {
+    if (conn.out.size() - conn.out_off_ > kMaxOutBytes / 2) {
       break;  // handle writes before reading more; LT re-arms EPOLLIN
     }
   }
@@ -371,8 +381,10 @@ bool RedisServer::HandleWritable(int fd) {
 
 bool RedisServer::FlushOut(int fd) {
   Conn& conn = conns_.at(fd);
-  while (!conn.out.empty()) {
-    const ssize_t n = ::write(fd, conn.out.data(), conn.out.size());
+  while (conn.out_off_ < conn.out.size()) {
+    const ssize_t n =
+        ::write(fd, conn.out.data() + conn.out_off_,
+                conn.out.size() - conn.out_off_);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -385,7 +397,13 @@ bool RedisServer::FlushOut(int fd) {
       }
       return false;
     }
-    conn.out.erase(0, static_cast<size_t>(n));
+    conn.out_off_ += static_cast<size_t>(n);
+  }
+  // Fully flushed: compact the buffer once per cycle (an O(n) move
+  // instead of erasing the prefix after every write).
+  if (conn.out_off_ > 0) {
+    conn.out.erase(0, conn.out_off_);
+    conn.out_off_ = 0;
   }
   if (conn.closing) {
     return false;  // protocol error reply (or backlog) flushed: now die
