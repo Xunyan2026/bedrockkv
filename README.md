@@ -72,6 +72,22 @@ replayer are coverage-guided fuzz targets (libFuzzer, 23M+ execs, zero
 findings; short fuzz smokes run in CI): numbers and analysis in
 `docs/benchmarks.md`.
 
+## MVCC snapshots (stage 4)
+
+`DB::GetSnapshot()` captures an immutable read point in the sequence
+timeline: reads through it (`Get`/`Scan` overloads) see exactly the
+writes up to that point, whatever is written, flushed or compacted
+afterwards — the standard leveldb MVCC scheme. Snapshot-aware
+compaction retains every version above the oldest live snapshot's
+sequence (plus the newest one at or below it) instead of collapsing to
+newest-only, and the vLog GC defers entirely while a snapshot lives —
+its liveness check reads latest state, which cannot know what a
+snapshot still pins. Snapshots are in-memory only: they do not survive
+a restart, and releasing the last one re-enables full version
+collapse. Randomized model testing (snapshot reads vs. frozen shadow
+maps across flush + compaction churn) under ASan/TSan backs the
+implementation.
+
 ## License
 
 MIT (to be finalized at v1.0).

@@ -24,14 +24,19 @@ void MemTable::Delete(uint64_t seq, std::string_view key) {
   approximate_size_ += key.size() + kTagSize + kLenPrefixSize + 24;
 }
 
-MemTable::Lookup MemTable::Get(std::string_view key, std::string* value) const {
-  // Seek with the largest possible tag: under "tag descending" ordering
-  // this lands on the newest version of `key` (or the first user key
-  // greater than `key`).
+MemTable::Lookup MemTable::Get(std::string_view key, std::string* value,
+                               uint64_t max_seq) const {
+  // Seek just past the newest version with seq <= max_seq: under "tag
+  // descending" ordering this lands on the newest VISIBLE version of
+  // `key` (or the first user key greater than `key`). max_seq = kMaxSeq
+  // (the latest-read default) overflows into tag ~0 — the same "newest"
+  // seek the table always did.
+  const uint64_t target_tag =
+      max_seq >= kMaxSeq ? ~static_cast<uint64_t>(0) : (max_seq << 8) | 0xff;
   std::string target;
   PutFixed32(&target, static_cast<uint32_t>(key.size()));
   target.append(key);
-  PutFixed64(&target, ~static_cast<uint64_t>(0));
+  PutFixed64(&target, target_tag);
 
   List::Iterator it(&list_);
   it.Seek(target);

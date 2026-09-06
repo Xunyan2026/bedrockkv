@@ -23,6 +23,7 @@ namespace {
 using bedrockkv::DB;
 using bedrockkv::Ring;
 using bedrockkv::Options;
+using bedrockkv::Snapshot;
 using bedrockkv::Status;
 using bedrockkv::SyncMode;
 using bedrockkv::testing::TestRng;
@@ -912,6 +913,346 @@ TEST(DBTest, VlogGcRunsAfterTriggerWithoutAnyRotation) {
     const std::string key = "k" + std::to_string(i);
     ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key;
     EXPECT_EQ(v, std::string(512, static_cast<char>(i & 0xff)));
+  }
+}
+
+// ---- MVCC snapshots (stage 4) ----
+
+TEST(DBTest, SnapshotIsolationAcrossOverwriteAndDelete) {
+  auto db = DB::Open(FreshDBDir("db_snap_basic"));
+  ASSERT_NE(db, nullptr);
+
+  ASSERT_TRUE(db->Put("a", "a1").ok());
+  ASSERT_TRUE(db->Put("b", "b1").ok());
+  Snapshot* snap = db->GetSnapshot();
+  ASSERT_NE(snap, nullptr);
+  EXPECT_EQ(snap->sequence(), db->latest_seq());
+
+  // Everything after the snapshot: overwrite, delete, brand-new key.
+  ASSERT_TRUE(db->Put("a", "a2").ok());
+  ASSERT_TRUE(db->Delete("b").ok());
+  ASSERT_TRUE(db->Put("c", "c1").ok());
+
+  // Latest state.
+  std::string v;
+  ASSERT_TRUE(db->Get("a", &v).ok());
+  EXPECT_EQ(v, "a2");
+  EXPECT_FALSE(db->Get("b", &v).ok());
+  ASSERT_TRUE(db->Get("c", &v).ok());
+  EXPECT_EQ(v, "c1");
+
+  // Snapshot state: frozen at capture time.
+  ASSERT_TRUE(db->Get("a", &v, snap).ok());
+  EXPECT_EQ(v, "a1") << "snapshot sees a stale value after overwrite";
+  ASSERT_TRUE(db->Get("b", &v, snap).ok())
+      << "snapshot must see the pre-tombstone value";
+  EXPECT_EQ(v, "b1");
+  EXPECT_FALSE(db->Get("c", &v, snap).ok())
+      << "key created after the snapshot must be invisible to it";
+
+  // Latest reads are unaffected by the snapshot's existence.
+  ASSERT_TRUE(db->Get("a", &v).ok());
+  EXPECT_EQ(v, "a2");
+
+  db->ReleaseSnapshot(snap);
+}
+
+TEST(DBTest, SnapshotSeqCapturesInFlightWrites) {
+  auto db = DB::Open(FreshDBDir("db_snap_seq"));
+  ASSERT_NE(db, nullptr);
+  ASSERT_TRUE(db->Put("k", "v1").ok());
+  Snapshot* snap = db->GetSnapshot();
+  ASSERT_TRUE(db->Put("k", "v2").ok());
+  // A snapshot taken between two writes must see the first one: its seq
+  // is the last ASSIGNED sequence, and Put assigns before returning.
+  EXPECT_EQ(snap->sequence(), 1u);
+  std::string v;
+  ASSERT_TRUE(db->Get("k", &v, snap).ok());
+  EXPECT_EQ(v, "v1");
+  db->ReleaseSnapshot(snap);
+}
+
+TEST(DBTest, SnapshotSurvivesFlushAndCompaction) {
+  // The heart of the feature: with the snapshot pinned, compaction must
+  // retain the versions the snapshot reads even across overwrites, and
+  // must keep tombstones that shadow them.
+  const std::string dir = FreshDBDir("db_snap_compact");
+  Options opts;
+  opts.sync_mode = SyncMode::kSyncNever;
+  opts.write_buffer_size = 16 * 1024;  // force flushes
+  opts.l0_compaction_trigger = 2;      // force L0 -> L1
+  opts.level_base_size = 64 * 1024;    // force L1 -> L2
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  ASSERT_TRUE(db->Put("k0", "old0").ok());
+  ASSERT_TRUE(db->Put("k1", "old1").ok());
+  ASSERT_TRUE(db->Put("k2", "old2").ok());
+  Snapshot* snap = db->GetSnapshot();
+
+  // Diverge hard: overwrite one, delete another, add a third.
+  ASSERT_TRUE(db->Put("k0", "new0").ok());
+  ASSERT_TRUE(db->Delete("k1").ok());
+  ASSERT_TRUE(db->Put("k3", "new3").ok());
+
+  // Push everything through flush + compaction while the snapshot lives.
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_TRUE(db->Put("filler" + std::to_string(i),
+                        std::string(2000, 'x')).ok());
+  }
+  db->wait_for_background_work();
+  ASSERT_GE(db->total_file_count(), 1u);
+
+  std::string v;
+  ASSERT_TRUE(db->Get("k0", &v, snap).ok())
+      << "compaction dropped a version a snapshot reads";
+  EXPECT_EQ(v, "old0");
+  ASSERT_TRUE(db->Get("k1", &v, snap).ok())
+      << "compaction dropped the pre-tombstone value";
+  EXPECT_EQ(v, "old1");
+  // k2 was never touched after the snapshot: both views agree on it.
+  ASSERT_TRUE(db->Get("k2", &v, snap).ok());
+  EXPECT_EQ(v, "old2");
+  EXPECT_FALSE(db->Get("k3", &v, snap).ok());
+
+  // Latest reads stay latest.
+  ASSERT_TRUE(db->Get("k0", &v).ok());
+  EXPECT_EQ(v, "new0");
+  EXPECT_FALSE(db->Get("k1", &v).ok());
+  ASSERT_TRUE(db->Get("k3", &v).ok());
+  EXPECT_EQ(v, "new3");
+
+  // Snapshot Scan sees the frozen state; latest Scan the live one.
+  std::map<std::string, std::string> snap_view, live_view;
+  ASSERT_TRUE(db->Scan("k", "l",
+                       [&snap_view](std::string_view k, std::string_view val) {
+                         snap_view.emplace(std::string(k), std::string(val));
+                       },
+                       snap).ok());
+  ASSERT_TRUE(db->Scan("k", "l",
+                       [&live_view](std::string_view k, std::string_view val) {
+                         live_view.emplace(std::string(k), std::string(val));
+                       }).ok());
+  EXPECT_EQ(snap_view.size(), 3u);  // k0..k2 as they were
+  EXPECT_EQ(snap_view.at("k0"), "old0");
+  EXPECT_EQ(snap_view.at("k1"), "old1");
+  EXPECT_EQ(snap_view.at("k2"), "old2");
+  EXPECT_EQ(live_view.size(), 3u);  // k0 (new) + k2 (untouched) + k3
+  EXPECT_EQ(live_view.at("k0"), "new0");
+  EXPECT_EQ(live_view.at("k2"), "old2");
+  EXPECT_EQ(live_view.count("k1"), 0u);
+
+  db->ReleaseSnapshot(snap);
+}
+
+TEST(DBTest, ReleasedSnapshotStopsPinningVersions) {
+  // Releasing the last snapshot must re-enable version collapse: after
+  // release + compaction the engine is free to drop what the snapshot
+  // read — and reads of the CURRENT state stay exactly right.
+  const std::string dir = FreshDBDir("db_snap_release");
+  Options opts;
+  opts.sync_mode = SyncMode::kSyncNever;
+  opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 2;
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  ASSERT_TRUE(db->Put("k", "old").ok());
+  Snapshot* snap = db->GetSnapshot();
+  ASSERT_TRUE(db->Put("k", "new").ok());
+  db->ReleaseSnapshot(snap);
+
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_TRUE(db->Put("f" + std::to_string(i), std::string(2000, 'y')).ok());
+  }
+  db->wait_for_background_work();
+
+  std::string v;
+  ASSERT_TRUE(db->Get("k", &v).ok());
+  EXPECT_EQ(v, "new");
+  // The released pointer must not be handed back a second time: a fresh
+  // snapshot captures the CURRENT sequence, not the released one.
+  Snapshot* fresh = db->GetSnapshot();
+  ASSERT_TRUE(db->Get("k", &v, fresh).ok());
+  EXPECT_EQ(v, "new");
+  db->ReleaseSnapshot(fresh);
+}
+
+TEST(DBTest, MultipleSnapshotsReadTheirOwnTime) {
+  auto db = DB::Open(FreshDBDir("db_snap_multi"));
+  ASSERT_NE(db, nullptr);
+
+  ASSERT_TRUE(db->Put("k", "v1").ok());
+  Snapshot* s1 = db->GetSnapshot();
+  ASSERT_TRUE(db->Put("k", "v2").ok());
+  Snapshot* s2 = db->GetSnapshot();
+  ASSERT_TRUE(db->Put("k", "v3").ok());
+  Snapshot* s3 = db->GetSnapshot();
+  ASSERT_TRUE(db->Put("k", "v4").ok());
+
+  std::string v;
+  ASSERT_TRUE(db->Get("k", &v, s1).ok());
+  EXPECT_EQ(v, "v1");
+  ASSERT_TRUE(db->Get("k", &v, s2).ok());
+  EXPECT_EQ(v, "v2");
+  ASSERT_TRUE(db->Get("k", &v, s3).ok());
+  EXPECT_EQ(v, "v3");
+  ASSERT_TRUE(db->Get("k", &v).ok());
+  EXPECT_EQ(v, "v4");
+
+  // Releasing the OLDEST snapshot must not disturb the younger ones.
+  db->ReleaseSnapshot(s1);
+  ASSERT_TRUE(db->Get("k", &v, s2).ok());
+  EXPECT_EQ(v, "v2");
+  ASSERT_TRUE(db->Get("k", &v, s3).ok());
+  EXPECT_EQ(v, "v3");
+  db->ReleaseSnapshot(s2);
+  db->ReleaseSnapshot(s3);
+}
+
+TEST(DBTest, SnapshotModelTestAcrossFlushesAndCompactions) {
+  // Randomized: a set of live snapshots, each with a shadow std::map.
+  // Every snapshot read (Get and Scan) must agree with its shadow, no
+  // matter how much flush/compaction churn happens in between.
+  const std::string dir = FreshDBDir("db_snap_model");
+  Options opts;
+  opts.sync_mode = SyncMode::kSyncNever;
+  opts.write_buffer_size = 8 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 32 * 1024;
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  TestRng rng(20260906u);
+  constexpr int kKeys = 30;
+  const auto key = [](int i) { return "key" + std::to_string(i); };
+
+  struct SnapView {
+    Snapshot* handle;
+    std::map<std::string, std::string> shadow;
+  };
+  std::vector<SnapView> views;
+  std::map<std::string, std::string> live;
+
+  for (int step = 0; step < 3000; ++step) {
+    const int k = static_cast<int>(rng.Uniform(kKeys));
+    switch (rng.Uniform(6)) {
+      case 0:
+      case 1:
+      case 2: {  // Put
+        const std::string val = "v" + std::to_string(step);
+        ASSERT_TRUE(db->Put(key(k), val).ok());
+        live[key(k)] = val;
+        break;
+      }
+      case 3: {  // Delete
+        ASSERT_TRUE(db->Delete(key(k)).ok());
+        live.erase(key(k));
+        break;
+      }
+      case 4: {  // snapshot
+        views.push_back({db->GetSnapshot(), live});
+        break;
+      }
+      case 5: {  // release the oldest view (often; keep some pressure)
+        if (!views.empty() && (step % 3 == 0)) {
+          db->ReleaseSnapshot(views.front().handle);
+          views.erase(views.begin());
+        }
+        break;
+      }
+    }
+
+    if (step % 97 == 0) {
+      db->wait_for_background_work();
+      std::string v;
+      // Latest reads against the live shadow.
+      for (int i = 0; i < kKeys; ++i) {
+        const Status s = db->Get(key(i), &v);
+        const auto it = live.find(key(i));
+        if (it == live.end()) {
+          EXPECT_FALSE(s.ok()) << "resurrected " << key(i);
+        } else {
+          ASSERT_TRUE(s.ok()) << "lost " << key(i);
+          EXPECT_EQ(v, it->second);
+        }
+      }
+      // Every snapshot read against its frozen shadow.
+      for (const SnapView& sv : views) {
+        for (int i = 0; i < kKeys; ++i) {
+          const Status s = db->Get(key(i), &v, sv.handle);
+          const auto it = sv.shadow.find(key(i));
+          if (it == sv.shadow.end()) {
+            EXPECT_FALSE(s.ok()) << "snapshot resurrected " << key(i);
+          } else {
+            ASSERT_TRUE(s.ok()) << "snapshot lost " << key(i);
+            EXPECT_EQ(v, it->second) << "stale value for " << key(i);
+          }
+        }
+        // And a full-range snapshot Scan.
+        std::map<std::string, std::string> scanned;
+        ASSERT_TRUE(
+            db->Scan("", "~", [&scanned](std::string_view k,
+                                         std::string_view val) {
+              scanned.emplace(std::string(k), std::string(val));
+            }, sv.handle).ok());
+        EXPECT_EQ(scanned, sv.shadow) << "snapshot Scan diverged";
+      }
+    }
+  }
+  for (const SnapView& sv : views) {
+    db->ReleaseSnapshot(sv.handle);
+  }
+}
+
+TEST(DBTest, VlogGcDeferredWhileSnapshotAlive) {
+  // A snapshot may pin an old pointer into a generation GC would
+  // reclaim. While it lives, GC must not run at all; releasing it must
+  // re-enable the trigger (wait_for_background_work re-notifies).
+  // Deterministic sizing: batch 1 (~400 x 530 B = 212 KiB) stays UNDER
+  // the 256 KiB trigger, so no GC can sneak in before the snapshot.
+  const std::string dir = FreshDBDir("db_snap_gc");
+  Options opts = SeparationOptions(256 * 1024);
+  opts.value_separation_threshold = 64;
+  opts.write_buffer_size = 32u << 20;  // no rotation: pure vLog pressure
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  const std::string value1(512, 'a');
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), value1).ok());
+  }
+  Snapshot* snap = db->GetSnapshot();
+
+  // Overwrite everything (batch-1 values become pure garbage) and push
+  // the generation well past the trigger — GC must still not run.
+  const std::string value2(512, 'z');
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), value2).ok());
+  }
+  db->wait_for_background_work();
+  EXPECT_EQ(db->vlog_gc_count(), 0u)
+      << "GC ran while a snapshot was alive";
+
+  // Every OLD value must still resolve through its (un-reclaimed) gen.
+  std::string v;
+  for (int i = 0; i < 400; i += 53) {
+    const std::string key = "k" + std::to_string(i);
+    ASSERT_TRUE(db->Get(key, &v, snap).ok()) << "snapshot lost " << key;
+    EXPECT_EQ(v, value1);
+  }
+  // Latest reads see the new values.
+  ASSERT_TRUE(db->Get("k53", &v).ok());
+  EXPECT_EQ(v, value2);
+
+  db->ReleaseSnapshot(snap);
+  db->wait_for_background_work();
+  EXPECT_GE(db->vlog_gc_count(), 1) << "GC never resumed after release";
+  EXPECT_EQ(CountFilesWithSuffix(dir, ".vlog"), 1);
+  for (int i = 0; i < 400; i += 53) {
+    const std::string key = "k" + std::to_string(i);
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key;
+    EXPECT_EQ(v, value2);
   }
 }
 

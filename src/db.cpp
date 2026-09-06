@@ -1025,8 +1025,8 @@ MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
                               const std::shared_ptr<MemTable>& imm,
                               const std::shared_ptr<Version>& v,
                               std::string_view key, std::string* stored,
-                              Status* error) const {
-  switch (mem->Get(key, stored)) {
+                              Status* error, uint64_t max_seq) const {
+  switch (mem->Get(key, stored, max_seq)) {
     case MemTable::Lookup::kFound:
       return MemTable::Lookup::kFound;
     case MemTable::Lookup::kDeleted:
@@ -1035,7 +1035,7 @@ MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
       break;
   }
   if (imm != nullptr) {
-    switch (imm->Get(key, stored)) {
+    switch (imm->Get(key, stored, max_seq)) {
       case MemTable::Lookup::kFound:
         return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
@@ -1051,7 +1051,7 @@ MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
   // an older file's value must not resurrect through it.
   for (const TableRef& r : v->l0) {
     Status s = Status::Ok();
-    switch (r.table->Get(key, stored, &s)) {
+    switch (r.table->Get(key, stored, max_seq, &s)) {
       case MemTable::Lookup::kFound:
         return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
@@ -1083,7 +1083,7 @@ MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
       continue;  // falls into the gap after that file
     }
     Status s = Status::Ok();
-    switch (it->table->Get(key, stored, &s)) {
+    switch (it->table->Get(key, stored, max_seq, &s)) {
       case MemTable::Lookup::kFound:
         return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
@@ -1102,21 +1102,33 @@ MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
 }
 
 Status DB::Get(std::string_view key, std::string* value) const {
+  return Get(key, value, nullptr);
+}
+
+Status DB::Get(std::string_view key, std::string* value,
+               const Snapshot* snapshot) const {
   // Snapshot under the mutex, then read lock-free: the shared_ptrs keep
   // the memtables and every table of the version alive even if a
   // concurrent flush/compaction publishes a new Version right away.
+  // The read point (seq) is captured in the same critical section — a
+  // snapshot read must see exactly the writes up to ITS sequence, so the
+  // version set and the sequence bound must come from one instant.
   std::shared_ptr<MemTable> mem, imm;
   std::shared_ptr<Version> v;
+  uint64_t seq = MemTable::kMaxSeq;
   {
     std::lock_guard<std::mutex> lk(mutex_);
     mem = mem_;
     imm = imm_;
     v = current_;
+    if (snapshot != nullptr) {
+      seq = snapshot->sequence();
+    }
   }
 
   std::string stored;
   Status error = Status::Ok();
-  switch (LookupIn(mem, imm, v, key, &stored, &error)) {
+  switch (LookupIn(mem, imm, v, key, &stored, &error, seq)) {
     case MemTable::Lookup::kFound:
       *value = std::move(stored);
       return MaybeResolvePointer(value);
@@ -1136,13 +1148,24 @@ Status DB::Get(std::string_view key, std::string* value) const {
 Status DB::Scan(std::string_view begin, std::string_view end,
                 const std::function<void(std::string_view, std::string_view)>&
                     fn) const {
+  return Scan(begin, end, fn, nullptr);
+}
+
+Status DB::Scan(std::string_view begin, std::string_view end,
+                const std::function<void(std::string_view, std::string_view)>&
+                    fn,
+                const Snapshot* snapshot) const {
   std::shared_ptr<MemTable> mem, imm;
   std::shared_ptr<Version> v;
+  uint64_t seq = MemTable::kMaxSeq;
   {
     std::lock_guard<std::mutex> lk(mutex_);
     mem = mem_;
     imm = imm_;
     v = current_;
+    if (snapshot != nullptr) {
+      seq = snapshot->sequence();
+    }
   }
 
   // Merge everything that can hold keys in [begin, end): both
@@ -1173,36 +1196,85 @@ Status DB::Scan(std::string_view begin, std::string_view end,
   MergingIterator iter(std::move(children));
   std::string target;
   target.append(begin);
-  PutFixed64(&target, ~static_cast<uint64_t>(0));  // newest-version seek
+  // Latest read (seq = kMaxSeq): the tag overflows to ~0 — the same
+  // newest-version seek as before. Snapshot read: seek to
+  // (seq << 8) | 0xFF so the start key's invisible newer versions are
+  // pruned by the seek itself; later keys are pruned by the loop below.
+  PutFixed64(&target, seq >= MemTable::kMaxSeq
+                          ? ~static_cast<uint64_t>(0)
+                          : (seq << 8) | 0xff);
   iter.Seek(target);
 
   std::string current_user;
   bool has_user = false;
+  bool current_emitted = false;  // snapshot: newest visible version found?
   while (iter.Valid()) {
     const std::string_view user = ExtractUserKey(iter.key());
     if (user >= end) {
       break;
     }
-    // First occurrence of a user key in merge order = newest version;
-    // every later occurrence is an older version to skip. Tombstones
-    // suppress the key entirely (older versions stay skipped).
     if (!has_user || user != current_user) {
       has_user = true;
       current_user.assign(user);
-      if ((ExtractTag(iter.key()) & 0xff) == kTypeValue) {
-        // Separated values arrive here as 21-byte pointers; resolve them
-        // so fn sees real bytes, exactly like Get does.
-        std::string resolved(iter.value());
-        const Status s = MaybeResolvePointer(&resolved);
-        if (!s.ok()) {
-          return s;
+      current_emitted = false;
+    }
+    if (!current_emitted) {
+      const uint64_t tag = ExtractTag(iter.key());
+      // For a snapshot read, versions with seq > S are invisible: keep
+      // walking to the oldest side until the first visible one. For a
+      // latest read the very first occurrence always passes (no version
+      // has seq > kMaxSeq), which reproduces the old first-wins rule.
+      if ((tag >> 8) <= seq) {
+        current_emitted = true;
+        if ((tag & 0xff) == kTypeValue) {
+          // Separated values arrive here as 21-byte pointers; resolve
+          // them so fn sees real bytes, exactly like Get does.
+          std::string resolved(iter.value());
+          const Status s = MaybeResolvePointer(&resolved);
+          if (!s.ok()) {
+            return s;
+          }
+          fn(user, resolved);
         }
-        fn(user, resolved);
       }
     }
     iter.Next();
   }
   return Status::Ok();
+}
+
+// ---- MVCC snapshots ----
+
+Snapshot* DB::GetSnapshot() {
+  // The read point is the last assigned sequence: a write in flight has
+  // already taken its seq under this same mutex, so the snapshot is
+  // guaranteed to see every Put/Delete that returned before GetSnapshot
+  // was called (and nothing newer).
+  std::lock_guard<std::mutex> lk(mutex_);
+  // Direct new, not make_unique: the constructor is private (DB is the
+  // friend make_unique lacks).
+  snapshots_.emplace_back(new Snapshot(next_seq_ - 1));
+  return snapshots_.back().get();
+}
+
+void DB::ReleaseSnapshot(Snapshot* snapshot) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (auto it = snapshots_.begin(); it != snapshots_.end(); ++it) {
+    if (it->get() == snapshot) {
+      snapshots_.erase(it);
+      return;
+    }
+  }
+}
+
+uint64_t DB::SmallestSnapshotSeq() const {
+  // Mutex held. kMaxSeq with no live snapshots — the "read everything"
+  // bound that makes compaction keep only the newest version.
+  uint64_t smallest = MemTable::kMaxSeq;
+  for (const auto& s : snapshots_) {
+    smallest = std::min(smallest, s->sequence());
+  }
+  return smallest;
 }
 
 // ---- value separation: pointer resolution + GC ----
@@ -1260,6 +1332,17 @@ bool DB::VlogGcNeeded() const {
   if (!vsep_enabled_ || vlog_current_ == nullptr) {
     return false;
   }
+  // A live snapshot may pin an OLD version of a key whose 21-byte
+  // pointer still selects bytes in a retired generation. A GC pass
+  // classifies that old version dead (its liveness check reads the
+  // LATEST state) and unlinks the file — the snapshot's next read would
+  // hit a gone generation. So GC is deferred entirely while any
+  // snapshot exists; releasing the last one re-enables it. (Same shape
+  // as compaction starvation: a long-lived snapshot delays reclamation,
+  // correctness is never at risk.)
+  if (!snapshots_.empty()) {
+    return false;
+  }
   if (vlogs_.size() > 1) {
     return true;
   }
@@ -1276,6 +1359,14 @@ Status DB::RunVlogGC() {
   uint64_t fresh_number = 0;
   {
     std::lock_guard<std::mutex> lk(mutex_);
+
+    // Snapshot guard (start): a snapshot pins old pointers into the
+    // generations this pass would retire. VlogGcNeeded already gates on
+    // it, but a snapshot can be created between that check and here —
+    // re-check under the same mutex that GetSnapshot holds.
+    if (!snapshots_.empty()) {
+      return Status::Ok();  // defer the whole pass
+    }
 
     // 1. Rotate to a fresh generation FIRST: the scans below then read
     //    files nobody appends to, and all rewrites (GC + user) land in
@@ -1397,6 +1488,20 @@ Status DB::RunVlogGC() {
   //    unnamed orphans and are removed on Open.
   {
     std::lock_guard<std::mutex> lk(mutex_);
+    // Snapshot guard (retirement): the scans above classified entries
+    // dead by LATEST visibility while releasing the mutex between
+    // entries. A snapshot created mid-pass may need exactly such an
+    // entry: its pointer was current when the snapshot was taken, but a
+    // newer write (after the snapshot) made it look dead. Rewriting
+    // cannot help — the rewrite gets a new seq the snapshot cannot see.
+    // So if any snapshot is alive NOW, abort the retirement: every
+    // generation stays published, the snapshot's pointers stay
+    // resolvable, and a later pass (after the last release) retries.
+    // Snapshots created AND released during the scan are safe either
+    // way: they could only read while the old files were still intact.
+    if (!snapshots_.empty()) {
+      return Status::Ok();
+    }
     // Durability BEFORE retirement: the MANIFEST below un-names the old
     // generations, and without this barrier a crash could drop the
     // (not-yet-fsynced) rewrite records while Open deletes the retired
@@ -1650,11 +1755,25 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
                          std::vector<TableRef> inputs_b,
                          size_t source_level_index,
                          size_t output_level_index) {
-  // Merge all inputs. Per user key, the merged internal-key order puts
-  // the newest version first; we keep exactly that one and drop older
-  // versions (no snapshot reads yet). Tombstones survive unless the
-  // output is the bottom level — elsewhere they must keep shadowing the
-  // levels below.
+  // Merge all inputs. Retention is per user key, newest version first,
+  // governed by the snapshot floor F = the smallest live snapshot's
+  // sequence (kMaxSeq with no snapshots):
+  //   * every version with seq > F is KEPT — some live snapshot may read
+  //     it (we don't know which sequences exist above F, so be liberal);
+  //   * the FIRST version with seq <= F is kept — it is what the oldest
+  //     snapshot (and every snapshot, and every latest read when no
+  //     newer version exists) must see;
+  //   * everything older is dropped — no reader can reach it anymore.
+  // With no snapshots this collapses to the classic keep-only-newest.
+  // Tombstones: a kept version that is a tombstone survives UNLESS the
+  // output is the bottom level — elsewhere it must keep shadowing the
+  // levels below; at the bottom nothing older exists, so it (and the
+  // versions it shadows) can all go.
+  uint64_t snapshot_floor = 0;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    snapshot_floor = SmallestSnapshotSeq();
+  }
   std::vector<std::unique_ptr<Iterator>> children;
   for (const TableRef& r : inputs_a) {
     children.push_back(r.table->NewIterator());
@@ -1671,6 +1790,7 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
   bool builder_used = false;
   std::string current_user;
   bool has_user = false;
+  bool floor_version_seen = false;  // per user key: passed seq <= floor?
   Status s = Status::Ok();
 
   const auto seal = [&]() {
@@ -1708,20 +1828,31 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
     if (!has_user || user != current_user) {
       has_user = true;
       current_user.assign(user);
-      const uint64_t tag = ExtractTag(ik);
-      const uint8_t type = static_cast<uint8_t>(tag & 0xff);
-      const bool drop = type == kTypeDeletion && bottom;
-      if (!drop) {
-        if (builder_used &&
-            builder.ApproximateFileSize() >= options_.max_sst_size) {
-          seal();  // split between user keys, never inside one
-          if (!s.ok()) {
-            break;
-          }
+      floor_version_seen = false;
+    }
+    const uint64_t tag = ExtractTag(ik);
+    const uint8_t type = static_cast<uint8_t>(tag & 0xff);
+    bool keep;
+    if ((tag >> 8) > snapshot_floor) {
+      keep = true;  // above the floor: some snapshot may still read it
+    } else if (!floor_version_seen) {
+      floor_version_seen = true;
+      // Newest version at-or-below the floor: what every snapshot sees.
+      // At the bottom level a tombstone here shadows nothing anymore.
+      keep = !(type == kTypeDeletion && bottom);
+    } else {
+      keep = false;  // older than any reader can reach
+    }
+    if (keep) {
+      if (builder_used &&
+          builder.ApproximateFileSize() >= options_.max_sst_size) {
+        seal();  // split between user keys, never inside one
+        if (!s.ok()) {
+          break;
         }
-        s = builder.Add(user, tag >> 8, type, iter.value());
-        builder_used = true;
       }
+      s = builder.Add(user, tag >> 8, type, iter.value());
+      builder_used = true;
     }
     iter.Next();
   }

@@ -33,9 +33,11 @@
 //             (leveled: one victim file + all overlapping next-level
 //             files, chosen by the same range-expansion fixpoint
 //             leveldb uses so output ranges stay disjoint);
-// merge rules: per user key keep only the newest version (no snapshot
-// reads yet); tombstones are dropped only when compacting INTO the
-// bottom level — elsewhere they must survive to shadow older levels.
+// merge rules: per user key, versions above the smallest live snapshot
+// sequence survive (a snapshot may still read them), plus the newest
+// version at-or-below it; older ones are dropped. Tombstones are
+// dropped only when compacting INTO the bottom level — elsewhere they
+// must survive to shadow older levels.
 //
 // Crash consistency is unchanged from the single-log design: the
 // MANIFEST is the sole source of truth (SST list + current log
@@ -124,6 +126,23 @@ struct Options {
   bool enable_io_uring = false;
 };
 
+// An immutable read point in the sequence-number timeline: a snapshot
+// captured at seq S sees exactly the writes with seq <= S, forever, no
+// matter what later writes, flushes or compactions do. Opaque handle
+// owned by the DB; obtain with DB::GetSnapshot(), retire with
+// DB::ReleaseSnapshot(). Snapshots live in memory only — they do not
+// survive a restart (after recovery every read is a latest read, and
+// compaction reclaims what the snapshots had pinned).
+class Snapshot {
+ public:
+  uint64_t sequence() const { return seq_; }
+
+ private:
+  friend class DB;
+  explicit Snapshot(uint64_t seq) : seq_(seq) {}
+  uint64_t seq_;
+};
+
 // L0..L6. levels_[i] below holds L(i+1); L0 is separate because its
 // files overlap and carry their own read order.
 constexpr size_t kMaxLevels = 7;
@@ -170,12 +189,32 @@ class DB {
   Status Delete(std::string_view key);
   // kNotFound when the key is absent OR deleted (tombstone).
   Status Get(std::string_view key, std::string* value) const;
+  // Snapshot read: sees exactly the writes with seq <= snapshot's
+  // sequence, whatever has been written since. nullptr snapshot (the
+  // overloads above) reads the latest state.
+  Status Get(std::string_view key, std::string* value,
+             const Snapshot* snapshot) const;
   // Invokes fn(user_key, value) for every live key in [begin, end),
   // newest version first, tombstones skipped. fn receives views that are
   // valid for the duration of the call.
   Status Scan(std::string_view begin, std::string_view end,
               const std::function<void(std::string_view, std::string_view)>& fn)
       const;
+  // Snapshot variant: same traversal restricted to snapshot-visible
+  // versions (per user key, the newest version with seq <= the
+  // snapshot's sequence).
+  Status Scan(std::string_view begin, std::string_view end,
+              const std::function<void(std::string_view, std::string_view)>& fn,
+              const Snapshot* snapshot) const;
+
+  // Captures a read point at the current write head. The DB keeps the
+  // snapshot (and the versions it pins, see RunCompaction) until
+  // ReleaseSnapshot. Returns a pointer the caller does NOT own; it stays
+  // valid until released (or the DB dies).
+  Snapshot* GetSnapshot();
+  // Retires a snapshot; the pointer must not be used afterwards. Releasing
+  // the last snapshot lets compaction collapse the versions it pinned.
+  void ReleaseSnapshot(Snapshot* snapshot);
 
   bool wal_truncated_on_recovery() const { return wal_truncated_; }
   uint64_t latest_seq() const { return next_seq_ - 1; }
@@ -240,7 +279,8 @@ class DB {
                             const std::shared_ptr<MemTable>& imm,
                             const std::shared_ptr<Version>& v,
                             std::string_view key, std::string* stored,
-                            Status* error) const;
+                            Status* error,
+                            uint64_t max_seq = MemTable::kMaxSeq) const;
   // Replaces a 21-byte value pointer in *value with the bytes it selects
   // (via the LRU cache + vLog pread). Inline values pass through.
   Status MaybeResolvePointer(std::string* value) const;
@@ -249,6 +289,10 @@ class DB {
   std::shared_ptr<VLog> VLogFor(uint64_t number) const;
   bool VlogGcNeeded() const;  // mutex held
   Status RunVlogGC();         // background thread, called without the lock
+  // Lowest sequence any live snapshot needs to see, i.e. the newest
+  // version of each key that must stay visible to SOME reader. UINT64_MAX
+  // with no snapshots (compaction then keeps only the newest version).
+  uint64_t SmallestSnapshotSeq() const;  // mutex held
 
   // ---- io_uring internals (all mutex_-held: single submitter) ----
   // Submits every queued WAL write SQE and waits for ALL outstanding
@@ -298,6 +342,11 @@ class DB {
   Options options_;
   uint64_t unsynced_bytes_ = 0;
   bool wal_truncated_ = false;
+
+  // Live MVCC snapshots (mutex_-guarded). Pointers handed out by
+  // GetSnapshot() stay valid because the unique_ptrs live here until
+  // ReleaseSnapshot erases the entry.
+  std::vector<std::unique_ptr<Snapshot>> snapshots_;
 
   uint64_t next_file_number_ = 1;
   uint64_t log_number_ = 0;

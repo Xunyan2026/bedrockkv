@@ -106,7 +106,10 @@ class Table {
   // means the newest version is a tombstone; kMissing means this file
   // has no version of the key (possibly a Bloom false positive checked
   // against the data). kCorruption on damaged structures.
+  // `max_seq` caps visibility (snapshot reads): only versions with
+  // seq <= max_seq are visible; the default reads the newest version.
   MemTable::Lookup Get(std::string_view user_key, std::string* value,
+                       uint64_t max_seq = MemTable::kMaxSeq,
                        Status* status = nullptr) const;
 
   uint64_t file_number() const { return file_number_; }

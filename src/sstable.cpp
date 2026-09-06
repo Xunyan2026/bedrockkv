@@ -268,7 +268,7 @@ bool Table::KeyMayMatchInBlock(size_t block_index,
 }
 
 MemTable::Lookup Table::Get(std::string_view user_key, std::string* value,
-                            Status* status) const {
+                            uint64_t max_seq, Status* status) const {
   const auto corrupt = [status, this](const std::string& what) {
     if (status != nullptr) {
       *status = Status::Corruption("sstable " + std::to_string(file_number_) +
@@ -277,13 +277,18 @@ MemTable::Lookup Table::Get(std::string_view user_key, std::string* value,
     return MemTable::Lookup::kMissing;
   };
 
-  // Search key: (user_key, tag = max) — under the internal comparator the
-  // first entry >= this target is exactly the newest version of user_key,
-  // if the file contains it at all.
+  // Search key: (user_key, tag). With max_seq = kMaxSeq the tag overflows
+  // to max and the first entry >= this target is exactly the newest
+  // version of user_key, if the file contains it at all. A snapshot read
+  // seeks to (max_seq << 8) | 0xff: the first entry at-or-below that tag
+  // is the newest version the snapshot may see.
+  const uint64_t target_tag =
+      max_seq >= MemTable::kMaxSeq ? ~static_cast<uint64_t>(0)
+                                   : (max_seq << 8) | 0xff;
   std::string target;
   target.reserve(user_key.size() + kTagSize);
   target.append(user_key);
-  PutFixed64(&target, ~static_cast<uint64_t>(0));
+  PutFixed64(&target, target_tag);
 
   const InternalKeyComparator less;
   const auto it = std::lower_bound(

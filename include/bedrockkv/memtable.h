@@ -42,7 +42,14 @@ class MemTable {
     kDeleted,  // newest version is a tombstone
     kMissing,  // no version of this key at all
   };
-  Lookup Get(std::string_view key, std::string* value) const;
+  // `max_seq` caps visibility: only versions with seq <= max_seq are
+  // considered. The default (see kMaxSeq below) reads the newest version;
+  // a snapshot read passes its captured sequence. Implemented by seeking
+  // to (key, tag = (max_seq << 8) | 0xFF) instead of (key, tag = max) —
+  // the first entry at-or-below that tag is the newest visible version.
+  static constexpr uint64_t kMaxSeq = ~static_cast<uint64_t>(0);
+  Lookup Get(std::string_view key, std::string* value,
+             uint64_t max_seq = kMaxSeq) const;
 
   // Rough in-memory footprint estimate — its only consumer is the future
   // flush trigger ("memtable is full, freeze it"), so precision is a
