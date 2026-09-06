@@ -17,7 +17,9 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 
+#include "bedrockkv/encoding.h"
 #include "bedrockkv/skiplist.h"
 
 namespace bedrockkv {
@@ -46,6 +48,23 @@ class MemTable {
   // non-goal.
   size_t ApproximateSize() const { return approximate_size_; }
   size_t Count() const { return list_.ApproximateSize(); }
+
+  // Invokes fn(seq, type, key, value) for every entry in memtable order:
+  // user key ascending, newest version first — exactly the order an SST
+  // requires. Decoding is the inverse of Put/Delete's encoding.
+  template <typename Fn>
+  void ForEach(Fn&& fn) const {
+    List::Iterator it(&list_);
+    for (it.SeekToFirst(); it.Valid(); it.Next()) {
+      const std::string& entry = it.key();
+      const uint32_t klen = GetFixed32(entry.data());
+      const uint64_t tag = GetFixed64(entry.data() + kLenPrefixSize + klen);
+      std::string_view key(entry.data() + kLenPrefixSize, klen);
+      std::string_view value(entry.data() + kLenPrefixSize + klen + kTagSize,
+                             entry.size() - kLenPrefixSize - klen - kTagSize);
+      fn(tag >> 8, static_cast<uint8_t>(tag & 0xff), key, value);
+    }
+  }
 
  private:
   static constexpr size_t kLenPrefixSize = 4;

@@ -38,6 +38,9 @@ add_library(bedrockkv
   src/crc32.cpp
   src/log.cpp
   src/memtable.cpp
+  src/block.cpp
+  src/sstable.cpp
+  src/fs_util.cpp
   src/db.cpp
 )
 target_include_directories(bedrockkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
