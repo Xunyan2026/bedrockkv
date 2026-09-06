@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 
+#include <sys/mman.h>
 #include <sys/utsname.h>
 
 #include <linux/io_uring.h>
