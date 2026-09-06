@@ -36,7 +36,7 @@ jobs:
         run: |
           # Passing tests' stdout is hidden by ctest; run the diagnostic
           # binary directly so its probe output reaches the annotations.
-          ./build/ring_test --gtest_filter='*DIAGNOSTIC*' > /tmp/diag_out.txt 2>&1 || true
+          ./build/tests/ring_test --gtest_filter='*DIAGNOSTIC*' > /tmp/diag_out.txt 2>&1 || true
           python3 - <<'PYEOF'
           text = open('/tmp/diag_out.txt', errors='replace').read()
           text += '\n=== ctest tail ===\n'
