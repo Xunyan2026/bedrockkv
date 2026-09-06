@@ -44,6 +44,27 @@ run proves the fallback is byte-for-byte the baseline. Design analysis of
 what io_uring can and cannot buy a single-writer engine:
 `docs/benchmarks.md` (stage 3 batch 3 section).
 
+## Redis-compatible server (stage 4)
+
+The engine speaks RESP2 over TCP — redis-cli and redis-benchmark connect
+out of the box:
+
+```sh
+./build/bedrockkv-server --port 7379 --dir /tmp/bedrockkv-demo
+redis-cli -p 7379 set greeting hello     # +OK
+redis-cli -p 7379 get greeting           # "hello"
+```
+
+Commands: `SET / GET / DEL / EXISTS / PING / ECHO`, binary-safe keys and
+values, inline commands for telnet sessions, pipelining (many commands
+per packet, one reply batch). Transport is a hand-written epoll
+(level-triggered) + non-blocking-fd event loop: one thread accepts,
+parses, executes and replies — Redis' own single-threaded model, which
+also satisfies the engine's single-writer `Put` contract with zero
+locks. Protocol errors close the connection with `-ERR`, exactly like
+real Redis; clients that stop reading are evicted once their reply
+backlog crosses 64 MiB.
+
 ## License
 
 MIT (to be finalized at v1.0).

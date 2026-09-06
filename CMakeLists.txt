@@ -44,8 +44,15 @@ add_library(bedrockkv
   src/ring.cpp
   src/vlog.cpp
   src/db.cpp
+  src/resp.cpp
+  src/server.cpp
 )
 target_include_directories(bedrockkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# ---- Server binary ----------------------------------------------------------
+# The demo endpoint: redis-cli / redis-benchmark connect here.
+add_executable(bedrockkv-server tools/server_main.cpp)
+target_link_libraries(bedrockkv-server PRIVATE bedrockkv)
 
 # ---- Benchmarks ----------------------------------------------------------
 # Not part of ctest: long-running by design. Run manually, e.g.

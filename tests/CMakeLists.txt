@@ -41,3 +41,11 @@ gtest_discover_tests(vlog_test)
 add_executable(ring_test ring_test.cpp)
 target_link_libraries(ring_test PRIVATE bedrockkv GTest::gtest_main)
 gtest_discover_tests(ring_test)
+
+add_executable(resp_test resp_test.cpp)
+target_link_libraries(resp_test PRIVATE bedrockkv GTest::gtest_main)
+gtest_discover_tests(resp_test)
+
+add_executable(server_test server_test.cpp)
+target_link_libraries(server_test PRIVATE bedrockkv GTest::gtest_main)
+gtest_discover_tests(server_test)
