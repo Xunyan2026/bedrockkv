@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 
+#include <sys/utsname.h>
+
 #include <gtest/gtest.h>
 
 #include "bedrockkv/ring.h"
@@ -122,6 +124,98 @@ TEST(RingTest, QueueFsyncCompletes) {
       },
       /*wait=*/false);
   EXPECT_EQ(errors, 0);
+  ::close(fd);
+  ::unlink(path.c_str());
+}
+
+// TEMPORARY CI-only diagnostic (gVisor has no io_uring): pin down where
+// an off=0 write lands on a real kernel. Prints everything; remove once
+// the async-WAL corruption is root-caused.
+TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
+  Status s = Status::Ok();
+  auto ring = Ring::Open(8, &s);
+  if (ring == nullptr) {
+    GTEST_SKIP() << "io_uring unavailable here: " << s.message();
+  }
+  utsname u{};
+  uname(&u);
+  std::printf("DIAG uname: %s %s\n", u.sysname, u.release);
+
+  const std::string path = TempPath("diag");
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  ASSERT_GE(fd, 0);
+
+  auto reap_log = [&](const char* tag) {
+    ring->Reap(
+        [&](uint64_t token, int res) {
+          std::printf("DIAG %s: cqe token=%llu res=%d\n", tag,
+                      static_cast<unsigned long long>(token), res);
+        },
+        /*wait=*/false);
+  };
+  auto dump = [&](const char* tag, size_t n) {
+    std::string out(n, '\0');
+    const ssize_t got = ::pread(fd, out.data(), n, 0);
+    std::printf("DIAG %s: end=%ld pread=%zd bytes=", tag,
+                static_cast<long>(::lseek(fd, 0, SEEK_END)), got);
+    for (char c : out) {
+      if (c >= 32 && c < 127) {
+        std::putchar(c);
+      } else {
+        std::printf("<%02x>", static_cast<unsigned char>(c));
+      }
+    }
+    std::printf("\n");
+  };
+
+  // Stage 1: single write at offset 0.
+  ::ftruncate(fd, 0);
+  const std::string a = "AAAAAAAAAA";
+  ASSERT_TRUE(ring->QueueWrite(fd, a.data(), a.size(), 0, 1));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage1");
+  dump("stage1-single-off0", 32);
+
+  // Stage 2: single write at offset 5.
+  ::ftruncate(fd, 0);
+  const std::string b = "BBBBBBBBBB";
+  ASSERT_TRUE(ring->QueueWrite(fd, b.data(), b.size(), 5, 2));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage2");
+  dump("stage2-single-off5", 32);
+
+  // Stage 3: two writes in one flush (the failing shape).
+  ::ftruncate(fd, 0);
+  const std::string c = "CCCCCCCCCC";
+  const std::string d = "DDDDDDDDDD";
+  ASSERT_TRUE(ring->QueueWrite(fd, c.data(), c.size(), 0, 3));
+  ASSERT_TRUE(ring->QueueWrite(fd, d.data(), d.size(), 10, 4));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage3");
+  dump("stage3-two-oneflush", 32);
+
+  // Stage 4: two writes with a flush between them.
+  ::ftruncate(fd, 0);
+  const std::string e = "EEEEEEEEEE";
+  const std::string f = "FFFFFFFFFF";
+  ASSERT_TRUE(ring->QueueWrite(fd, e.data(), e.size(), 0, 5));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage4a");
+  ASSERT_TRUE(ring->QueueWrite(fd, f.data(), f.size(), 10, 6));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage4b");
+  dump("stage4-two-sepflush", 32);
+
+  // Stage 5: non-sparse file — pre-fill with 'Z', overwrite at 0.
+  ::ftruncate(fd, 0);
+  std::string z(32, 'Z');
+  ASSERT_EQ(::pwrite(fd, z.data(), z.size(), 0), 32);
+  const std::string g = "GGGGGGGGGG";
+  ASSERT_TRUE(ring->QueueWrite(fd, g.data(), g.size(), 0, 7));
+  ASSERT_TRUE(ring->Flush(true));
+  reap_log("stage5");
+  dump("stage5-overwrite-off0", 32);
+
   ::close(fd);
   ::unlink(path.c_str());
 }
