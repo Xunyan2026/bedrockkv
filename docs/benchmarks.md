@@ -117,3 +117,60 @@ exactly (4.88 / 3.76 / 3.82 / 3.76 / 3.76 / 5.03x): the flag changes
 nothing except the separation path. Verified with 62 + 1 regression tests
 (gtest), ASan/LSan clean, TSan clean over repeated A-workload stress runs
 including a lock-free vLog read path against concurrent GC appends.
+
+## Stage 3 batch 3: io_uring async I/O — graceful degradation report (2026-09-06)
+
+The plan called for liburing-based async WAL appends and flush writes with
+an `Options::enable_io_uring` switch, degrading honestly where unsupported.
+What landed (all raw syscalls, no liburing dependency — `ring.h`/`ring.cpp`
+vendor the ~200-line ring: `io_uring_setup` + three mmaps + `io_uring_enter`):
+
+- **Async WAL writes**: records are encoded by the same fragmentation code
+  as the sync path (`log::Writer::EncodeRecord`, byte-identical output) and
+  submitted as explicit-offset pwrite SQEs — no O_APPEND, so disjoint
+  in-flight writes cannot reorder; a torn tail on crash is bounded by the
+  existing WAL CRC logic. Buffers live in a token-indexed map until their
+  completions are reaped (before every fsync, rotation, and shutdown).
+- **The real prize, fsync pairing**: MaybeSync submits the vLog and WAL
+  fsyncs as one parallel SQE pair and waits once — one round trip where
+  the sync path pays two sequential ones. On real storage (fsync ≈ ms)
+  this is the win; on tmpfs it is unmeasurable, and here it cannot run.
+- **Honest degradation**: this environment is gVisor with io_uring
+  disabled — `io_uring_setup(8, &params)` returns ENOSYS (probed twice,
+  with NULL and full params). `Options::enable_io_uring = true` therefore
+  opens on the synchronous path, `io_uring_active() == false`, the reason
+  is carried verbatim, and the bench header prints
+  `io_uring=unavailable (io_uring_setup failed: Function not implemented)`.
+  A unit test passes in BOTH worlds: active-and-correct where supported,
+  clean-fallback-and-identical where not.
+
+### Zero-regression proof on this host (io_uring requested, unavailable)
+
+Same-day control run, `--workload all --io_uring` vs the batch-1 baseline:
+write amplification **byte-identical on every workload** (4.88 / 3.76 /
+3.82 / 3.76 / 3.76 / 5.03x) — the fallback path is the baseline path by
+construction, and the run proves nothing else drifted.
+
+### Where io_uring would and would not help this engine (design analysis)
+
+- **Would not (as designed): WAL write batching.** BedrockKV has ONE
+  writer thread and a synchronous `Put`; the batching horizon is one
+  record. Deferring submissions to batch them would break the WAL contract
+  (a queued-but-unsubmitted record is lost to a process crash). The async
+  path therefore submits per record — same syscall count as `write()`, no
+  gain, by design. Real WAL batching requires group commit across
+  concurrent writers, a deliberate architecture change.
+- **Would: the fsync pair above**, Scan's per-record vLog pointer
+  resolution (batch the scan range's preads into one enter — the E
+  workload's 18.5k ops/s scan tax is exactly this), and compaction's
+  multi-file reads (currently sequential whole-file reads). All three are
+  wired for follow-up work; the ring exists and the reaping discipline is
+  in place.
+
+![baseline vs value separation across YCSB A–F](benchmarks-stage3.png)
+
+Figure: the stage-3 result so far — write amplification (left) drops
+4.88x → 2.26x on A and 5.03x → 1.95x on F; max latency (right) drops
+580 ms → 40 ms as compaction stalls disappear. E's max latency is flat
+(28.2 → 30.3 ms): its cost is scan throughput (pointer resolution), not
+tail stalls — the first io_uring follow-up target.

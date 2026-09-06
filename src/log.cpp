@@ -12,6 +12,14 @@ namespace bedrockkv::log {
 
 // ---- Writer ----------------------------------------------------------------
 
+namespace {
+
+// Block tail shorter than a header is zero-padded (readers skip zero
+// headers); max pad = kHeaderSize - 1 bytes.
+constexpr char kZeros[kHeaderSize - 1] = {0};
+
+}  // namespace
+
 Status Writer::WriteAll(const char* data, size_t n) {
   size_t done = 0;
   while (done < n) {
@@ -28,27 +36,25 @@ Status Writer::WriteAll(const char* data, size_t n) {
   return Status::Ok();
 }
 
-Status Writer::AddRecord(std::string_view payload) {
+Status Writer::EncodeRecord(std::string_view payload, uint64_t absolute_offset,
+                            std::string* out) {
+  out->clear();
+  size_t block_off = absolute_offset % kBlockSize;
   const char* p = payload.data();
   size_t left = payload.size();
   bool begin = true;
-  Status s;
   do {
-    const size_t leftover = kBlockSize - block_offset_;
+    const size_t leftover = kBlockSize - block_off;
     if (leftover < kHeaderSize) {
       // Cannot even fit a header in the remaining block tail: zero-pad it
       // (readers skip short tails and zero headers) and start a new block.
       if (leftover > 0) {
-        static constexpr char kZeros[kHeaderSize - 1] = {0};  // max pad = 8B
-        s = WriteAll(kZeros, leftover);
-        if (!s.ok()) {
-          return s;
-        }
+        out->append(kZeros, leftover);
       }
-      block_offset_ = 0;
+      block_off = 0;
     }
 
-    const size_t avail = kBlockSize - block_offset_ - kHeaderSize;
+    const size_t avail = kBlockSize - block_off - kHeaderSize;
     const size_t frag = left < avail ? left : avail;
     RecordType type;
     if (begin && frag == left) {
@@ -61,40 +67,39 @@ Status Writer::AddRecord(std::string_view payload) {
       type = kMiddleType;
     }
 
-    s = EmitPhysicalRecord(type, p, frag);
-    if (!s.ok()) {
-      return s;
-    }
+    // Header + payload as one contiguous span: the sync path writes it in
+    // a single syscall, the async path submits one SQE.
+    char header[kHeaderSize];
+    PutFixed32(header, static_cast<uint32_t>(frag));
+    uint32_t crc = Crc32(&type, 1);  // crc covers type + payload
+    crc = Crc32(p, frag, crc);
+    PutFixed32(header + 4, crc);
+    header[8] = static_cast<char>(type);
+    out->append(header, kHeaderSize);
+    out->append(p, frag);
+
     p += frag;
     left -= frag;
     begin = false;
+    block_off += kHeaderSize + frag;  // <= kBlockSize by construction
   } while (left > 0);
 
   return Status::Ok();
 }
 
-Status Writer::EmitPhysicalRecord(RecordType type, const char* payload,
-                                  size_t len) {
-  char header[kHeaderSize];
-  PutFixed32(header, static_cast<uint32_t>(len));
-  uint32_t crc = Crc32(&type, 1);           // crc covers type + payload
-  crc = Crc32(payload, len, crc);
-  PutFixed32(header + 4, crc);
-  header[8] = static_cast<char>(type);
-
-  // One contiguous ::write for header+payload: one syscall, no writev
-  // juggling. A torn write is still possible under crash — the Reader
-  // exists precisely to detect and bound it.
-  char buf[kHeaderSize + kBlockSize];
-  std::memcpy(buf, header, kHeaderSize);
-  if (len > 0) {
-    std::memcpy(buf + kHeaderSize, payload, len);
+Status Writer::AddRecord(std::string_view payload) {
+  std::string buf;
+  const Status s = EncodeRecord(payload, file_offset_, &buf);
+  if (!s.ok()) {
+    return s;
   }
-  Status s = WriteAll(buf, kHeaderSize + len);
-  if (s.ok()) {
-    block_offset_ += kHeaderSize + len;  // <= kBlockSize by construction
+  // One contiguous write per logical record (fragments merged). A torn
+  // write is still possible under crash — the Reader exists to bound it.
+  const Status w = WriteAll(buf.data(), buf.size());
+  if (w.ok()) {
+    file_offset_ += buf.size();
   }
-  return s;
+  return w;
 }
 
 // ---- Reader ----------------------------------------------------------------

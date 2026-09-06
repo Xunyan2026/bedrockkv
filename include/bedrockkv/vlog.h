@@ -94,6 +94,9 @@ class VLog {
 
   uint64_t file_number() const { return number_; }
   uint64_t file_size() const { return end_.load(std::memory_order_relaxed); }
+  // Raw fd, exposed for the DB's parallel vLog+WAL fsync SQE pair —
+  // never written or closed by callers.
+  int fd() const { return fd_; }
 
  private:
   VLog(int fd, uint64_t number, uint64_t end)

@@ -47,18 +47,28 @@ class Writer {
   // in-block position and the file becomes unreadable at real block
   // boundaries. Defaults to 0 (fresh file).
   explicit Writer(int fd, uint64_t initial_file_offset = 0)
-      : fd_(fd), block_offset_(initial_file_offset % kBlockSize) {}
+      : fd_(fd), file_offset_(initial_file_offset) {}
 
   Status AddRecord(std::string_view payload);
-  // Offset within the current block (diagnostics only).
-  size_t block_offset() const { return block_offset_; }
+
+  // Encodes `payload` as it would sit at `absolute_offset` — headers,
+  // fragmentation into block-local records, zero tail padding — into *out
+  // WITHOUT touching any file. The async WAL path uses this to prepare
+  // bytes for io_uring pwrite SQEs (explicit offsets), the sync path is
+  // AddRecord above. Both share one fragmentation implementation so the
+  // two write modes can never drift apart.
+  static Status EncodeRecord(std::string_view payload, uint64_t absolute_offset,
+                             std::string* out);
+
+  // Absolute file offset of the next record (diagnostics; also the offset
+  // the async path needs for its next pwrite).
+  uint64_t file_offset() const { return file_offset_; }
 
  private:
   Status WriteAll(const char* data, size_t n);
-  Status EmitPhysicalRecord(RecordType type, const char* payload, size_t len);
 
   int fd_;
-  size_t block_offset_ = 0;
+  uint64_t file_offset_ = 0;  // next byte to write (absolute)
 };
 
 // Reads records back sequentially. Tolerates a torn tail (crash mid-write):

@@ -15,11 +15,13 @@
 #include <gtest/gtest.h>
 
 #include "bedrockkv/db.h"
+#include "bedrockkv/ring.h"
 #include "test_util.h"
 
 namespace {
 
 using bedrockkv::DB;
+using bedrockkv::Ring;
 using bedrockkv::Options;
 using bedrockkv::Status;
 using bedrockkv::SyncMode;
@@ -749,6 +751,55 @@ TEST(DBTest, VlogGcReclaimsGarbageKeepsLive) {
 
 // The full model test, separation on: random puts/gets/deletes against
 // std::map with flushes, compaction and GC all firing underneath.
+// The io_uring fast path: requested in Options, best-effort at Open.
+// On a kernel/sandbox without io_uring (gVisor: ENOSYS) the DB must open
+// fine on the synchronous path, report why, and behave identically; on
+// an io_uring host the async WAL + parallel-fsync path must be exercised
+// by every operation below. Either way the full model check runs.
+TEST(DBTest, IoUringOptionDegradesOrActivates) {
+  const std::string dir = FreshDBDir("db_uring");
+  Options opts = SeparationOptions(64u << 10);
+  opts.enable_io_uring = true;
+  opts.write_buffer_size = 32 * 1024;   // force rotations with async WAL
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  if (db->io_uring_active()) {
+    EXPECT_TRUE(db->io_uring_unavailable_reason().empty());
+  } else {
+    EXPECT_FALSE(db->io_uring_unavailable_reason().empty());
+  }
+
+  // Data through every write shape: plain puts, overwrites, deletes,
+  // separated values, forced rotations, flushes, and a reopen that
+  // replays whatever the async WAL left behind.
+  std::map<std::string, std::string> model;
+  for (int i = 0; i < 400; ++i) {
+    const std::string key = "k" + std::to_string(i % 120);
+    const std::string value(i % 3 == 0 ? std::string(2048, 'a' + (i % 26))
+                                       : std::string(40, 'a' + (i % 26)));
+    ASSERT_TRUE(db->Put(key, value).ok());
+    model[key] = value;
+    if (i % 97 == 0) {
+      ASSERT_TRUE(db->Delete(key).ok());
+      model.erase(key);
+    }
+  }
+  db->wait_for_background_work();
+  std::string v;
+  for (const auto& [key, expected] : model) {
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key;
+    EXPECT_EQ(v, expected);
+  }
+  db.reset();
+  db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(db->io_uring_active(), Ring::Supported());
+  for (const auto& [key, expected] : model) {
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key << " after reopen";
+    EXPECT_EQ(v, expected);
+  }
+}
+
 TEST(DBTest, SeparationModelTestAgainstStdMap) {
   const std::string dir = FreshDBDir("db_vsep_model");
   Options opts = SeparationOptions(32u << 10);

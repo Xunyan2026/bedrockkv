@@ -479,6 +479,24 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   const uint64_t log_end = static_cast<uint64_t>(::lseek(fd, 0, SEEK_END));
   db->log_writer_ = std::make_unique<log::Writer>(fd, log_end);
 
+  // Async I/O (stage 3 batch 3). Ring creation is best-effort: a kernel
+  // or sandbox without io_uring (gVisor: ENOSYS) leaves the engine on the
+  // synchronous path — io_uring_active()/io_uring_unavailable_reason()
+  // report what happened, and the benchmark prints it. Nothing else in
+  // Open depends on this succeeding.
+  if (db->options_.enable_io_uring) {
+    Status rs = Status::Ok();
+    db->ring_ = Ring::Open(64, &rs);
+    if (db->ring_ != nullptr) {
+      db->io_uring_active_ = true;
+      db->wal_size_ = log_end;
+    } else {
+      db->io_uring_reason_ = rs.message();
+    }
+  } else {
+    db->io_uring_reason_ = "not requested (Options::enable_io_uring)";
+  }
+
   // ---- 6. start the background flush/compaction thread (last: no
   //        failing step may run after the thread exists) ----
   DB* raw = db.get();
@@ -494,6 +512,12 @@ DB::~DB() {
   signal_.notify_all();
   if (bg_.joinable()) {
     bg_.join();
+  }
+  if (io_uring_active_) {
+    // Last writer standing: make sure in-flight WAL bytes reached the
+    // page cache before the fd (and the ring) disappear. Best-effort —
+    // a failure here has nowhere to go at shutdown.
+    static_cast<void>(DrainWalRing());
   }
   if (log_fd_ >= 0) {
     ::close(log_fd_);
@@ -634,12 +658,58 @@ Status DB::WriteEntry(uint8_t type, std::string_view key,
     PutFixed32(&payload, static_cast<uint32_t>(stored.size()));
     payload.append(stored);
   }
-  Status s = log_writer_->AddRecord(payload);
-  if (!s.ok()) {
-    return s;
+  Status s = Status::Ok();
+  if (io_uring_active_) {
+    // Async path: encode at the log's absolute end offset (no O_APPEND —
+    // pwrite SQEs carry explicit offsets, so disjoint writes can complete
+    // in any order without corrupting the record stream) and submit one
+    // SQE. The buffer lives in wal_pending_ until its completion is
+    // reaped (before every fsync / rotation / close). One enter() per
+    // record here mirrors the sync path's one write() per record — the
+    // batching wins come from the fsync pair in MaybeSync, not from
+    // deferring submissions (a queued-but-unsubmitted record would break
+    // the WAL's process-crash contract).
+    std::string buf;
+    s = log::Writer::EncodeRecord(payload, wal_size_, &buf);
+    if (!s.ok()) {
+      return s;
+    }
+    ++wal_token_;
+    wal_pending_.emplace(wal_token_, std::move(buf));
+    if (!ring_->QueueWrite(log_fd_, wal_pending_[wal_token_].data(),
+                           wal_pending_[wal_token_].size(), wal_size_,
+                           wal_token_)) {
+      wal_pending_.erase(wal_token_);
+      return Status::IOError("io_uring submission queue full");
+    }
+    unsynced_bytes_ += wal_pending_[wal_token_].size();
+    stats_wal_bytes_ += wal_pending_[wal_token_].size();
+    wal_size_ += wal_pending_[wal_token_].size();
+    // Submit immediately (a queued-but-unsubmitted record breaks the
+    // WAL's process-crash contract) and opportunistically reap whatever
+    // already completed — no extra syscall, and wal_pending_'s buffers
+    // stay bounded even under kSyncNever, which rarely drains.
+    if (!ring_->Flush(false)) {
+      return Status::IOError("io_uring_enter submit failed: " +
+                             std::string(std::strerror(errno)));
+    }
+    ring_->Reap(
+        [this](uint64_t token, int res) {
+          wal_pending_.erase(token);
+          if (res < 0 && wal_ring_error_.ok()) {
+            wal_ring_error_ = Status::IOError("async WAL write failed: " +
+                                              std::string(std::strerror(-res)));
+          }
+        },
+        /*wait=*/false);
+  } else {
+    s = log_writer_->AddRecord(payload);
+    if (!s.ok()) {
+      return s;
+    }
+    unsynced_bytes_ += payload.size() + log::kHeaderSize;
+    stats_wal_bytes_ += payload.size() + log::kHeaderSize;
   }
-  unsynced_bytes_ += payload.size() + log::kHeaderSize;
-  stats_wal_bytes_ += payload.size() + log::kHeaderSize;
   if (count_user_bytes) {
     stats_user_bytes_ += key.size() + value.size();
   }
@@ -668,6 +738,32 @@ Status DB::MaybeSync() {
     case SyncMode::kSyncNever:
       return Status::Ok();
   }
+  if (io_uring_active_) {
+    // An earlier reap may have found a failed write CQE after its Put
+    // had already returned — surface it at the next durability point
+    // (the caller of Put/MaybeSync is the same writer thread).
+    if (!wal_ring_error_.ok()) {
+      const Status s = wal_ring_error_;
+      wal_ring_error_ = Status::Ok();
+      return s;
+    }
+    if (need) {
+      // Order matters: every WAL byte must be at least in the page cache
+      // before any fsync is allowed to claim it durable.
+      const Status d = DrainWalRing();
+      if (!d.ok()) {
+        return d;
+      }
+      // The headline io_uring win: vLog + WAL fsyncs as one parallel
+      // SQE pair — one round trip where the sync path pays two.
+      const Status p = SyncViaRing();
+      if (!p.ok()) {
+        return p;
+      }
+    }
+    unsynced_bytes_ = 0;
+    return Status::Ok();
+  }
   if (need) {
     // vLog BEFORE WAL (see WriteEntry): the WAL record's durability must
     // imply the durability of the vLog bytes it points at.
@@ -686,10 +782,74 @@ Status DB::MaybeSync() {
   return Status::Ok();
 }
 
+Status DB::DrainWalRing() {
+  // Mutex held. Submit whatever is queued and sleep until EVERY
+  // outstanding completion (writes and fsyncs alike) has arrived — the
+  // points that call this (pre-fsync, pre-rotation, shutdown) are exactly
+  // the ones after which WAL bytes must be at least in the page cache.
+  if (ring_->outstanding() == 0) {
+    return Status::Ok();
+  }
+  if (!ring_->Flush(true)) {
+    return Status::IOError("io_uring_enter wait failed: " +
+                           std::string(std::strerror(errno)));
+  }
+  Status err = Status::Ok();
+  ring_->Reap(
+      [&](uint64_t token, int res) {
+        wal_pending_.erase(token);
+        if (res < 0 && err.ok()) {
+          err = Status::IOError("async WAL write failed: " +
+                                std::string(std::strerror(-res)));
+        }
+      },
+      /*wait=*/false);  // Flush(true) already waited
+  return err;
+}
+
+Status DB::SyncViaRing() {
+  // Mutex held; DrainWalRing already ran, so the fsyncs below claim only
+  // completed writes. Two independent files, one parallel SQE pair, one
+  // wait — the sequential-sync-path's two round trips collapse into one.
+  ++wal_token_;
+  if (!ring_->QueueFsync(log_fd_, wal_token_)) {
+    return Status::IOError("io_uring submission queue full");
+  }
+  if (vlog_current_ != nullptr) {
+    ++wal_token_;
+    if (!ring_->QueueFsync(vlog_current_->fd(), wal_token_)) {
+      return Status::IOError("io_uring submission queue full");
+    }
+  }
+  if (!ring_->Flush(true)) {
+    return Status::IOError("io_uring_enter wait failed: " +
+                           std::string(std::strerror(errno)));
+  }
+  Status err = Status::Ok();
+  ring_->Reap(
+      [&](uint64_t, int res) {
+        if (res < 0 && err.ok()) {
+          err = Status::IOError("async fsync failed: " +
+                                std::string(std::strerror(-res)));
+        }
+      },
+      /*wait=*/false);
+  return err;
+}
+
 Status DB::RotateForFlush() {
   // Mutex held. Freeze the memtable, switch to a fresh log generation.
   // The new log file is created and fsynced HERE so that the background
   // flush can safely publish a MANIFEST naming it (see the flush step).
+  if (io_uring_active_) {
+    // Outstanding write SQEs reference the old fd, and the old log file
+    // is unlinked as soon as its flush installs — drain first so no CQE
+    // can ever outlive the file it wrote.
+    const Status d = DrainWalRing();
+    if (!d.ok()) {
+      return d;
+    }
+  }
   const uint64_t new_log = next_file_number_++;
   const int fd = ::open(LogPath(new_log).c_str(),
                         O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
@@ -713,6 +873,7 @@ Status DB::RotateForFlush() {
   log_fd_ = fd;
   log_number_ = new_log;
   log_writer_ = std::make_unique<log::Writer>(fd, 0);
+  wal_size_ = 0;  // fresh generation: SQE offsets restart at 0
   unsynced_bytes_ = 0;
   if (old_fd >= 0) {
     ::close(old_fd);  // file stays on disk until the flush publishes

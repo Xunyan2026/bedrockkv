@@ -4,8 +4,9 @@ A high-performance, persistent LSM-Tree based key-value storage engine written i
 
 > 🚧 Work in progress. This README will grow with architecture diagrams and
 > benchmark data as the project reaches its milestones. Roadmap: WAL +
-> MemTable → SSTable + Leveled Compaction → WiscKey value separation + io_uring
-> → Redis RESP2-compatible server → benchmarks vs. LevelDB.
+> MemTable → SSTable + Leveled Compaction → YCSB harness → WiscKey value
+> separation (done) + io_uring async I/O → Redis RESP2-compatible server →
+> benchmarks vs. LevelDB.
 
 ## Build
 
@@ -29,6 +30,19 @@ and tail latency 572 ms → 40 ms (numbers and method:
 `docs/vlog-format.md`). Known simplification: a user value that happens to
 be exactly 21 bytes starting with `0xFF` is indistinguishable from a
 pointer — documented in the format spec, removable with a metadata byte.
+
+## Async I/O (io_uring)
+
+`Options::enable_io_uring` activates a hand-rolled io_uring ring (raw
+syscalls + mmap, no liburing). Where the kernel supports it: WAL records
+go out as explicit-offset pwrite SQEs (shared fragmentation code with the
+sync path, byte-identical output) and the vLog + WAL fsyncs run as one
+parallel SQE pair. Where it doesn't — this project's gVisor sandbox
+returns ENOSYS — the engine opens identically on the synchronous path,
+`io_uring_active()` reports false with the kernel's reason, and a control
+run proves the fallback is byte-for-byte the baseline. Design analysis of
+what io_uring can and cannot buy a single-writer engine:
+`docs/benchmarks.md` (stage 3 batch 3 section).
 
 ## License
 

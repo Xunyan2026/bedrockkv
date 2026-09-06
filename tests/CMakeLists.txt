@@ -37,3 +37,7 @@ gtest_discover_tests(memtable_test)
 gtest_discover_tests(iterator_test)
 gtest_discover_tests(sstable_test)
 gtest_discover_tests(vlog_test)
+
+add_executable(ring_test ring_test.cpp)
+target_link_libraries(ring_test PRIVATE bedrockkv GTest::gtest_main)
+gtest_discover_tests(ring_test)

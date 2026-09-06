@@ -77,6 +77,7 @@
 #include "bedrockkv/log.h"
 #include "bedrockkv/lru_cache.h"
 #include "bedrockkv/memtable.h"
+#include "bedrockkv/ring.h"
 #include "bedrockkv/status.h"
 #include "bedrockkv/sstable.h"
 #include "bedrockkv/vlog.h"
@@ -111,6 +112,16 @@ struct Options {
   bool enable_value_separation = false;
   size_t value_separation_threshold = 1024;
   size_t vlog_gc_size = 64u << 20;
+  // Async I/O (stage 3 batch 3). When true, the DB tries to open an
+  // io_uring ring (raw syscalls, no liburing — include/bedrockkv/ring.h).
+  // If the kernel or sandbox does not implement io_uring (gVisor disables
+  // it: ENOSYS), Open still SUCCEEDS and the engine falls back to the
+  // synchronous write path — io_uring_active() reports what actually
+  // happened, and io_uring_unavailable_reason() why. What the ring buys
+  // where it exists: WAL record writes via explicit-offset pwrite SQEs,
+  // and — the real prize — vLog + WAL fsyncs issued as a parallel pair
+  // instead of two sequential round trips (MaybeSync).
+  bool enable_io_uring = false;
 };
 
 // L0..L6. levels_[i] below holds L(i+1); L0 is separate because its
@@ -169,6 +180,12 @@ class DB {
   bool wal_truncated_on_recovery() const { return wal_truncated_; }
   uint64_t latest_seq() const { return next_seq_ - 1; }
   uint64_t log_number() const { return log_number_; }
+  // Whether the io_uring fast path is actually in use (requested AND
+  // supported by this kernel/sandbox).
+  bool io_uring_active() const { return io_uring_active_; }
+  const std::string& io_uring_unavailable_reason() const {
+    return io_uring_reason_;
+  }
   // Files per level (0 = L0) and in total — observability/tests.
   size_t level_file_count(size_t level) const;
   size_t total_file_count() const;
@@ -233,6 +250,17 @@ class DB {
   bool VlogGcNeeded() const;  // mutex held
   Status RunVlogGC();         // background thread, called without the lock
 
+  // ---- io_uring internals (all mutex_-held: single submitter) ----
+  // Submits every queued WAL write SQE and waits for ALL outstanding
+  // completions, reaping them into wal_pending_ bookkeeping. Returns the
+  // first completion error, if any. Called before every fsync, before a
+  // log rotation closes an fd, and at shutdown — the points after which
+  // the data must be at least in the page cache.
+  Status DrainWalRing();  // mutex held
+  // Submits an fsync pair (vLog + WAL) as parallel SQEs and waits — the
+  // MaybeSync fast path when the ring is active.
+  Status SyncViaRing();   // mutex held
+
   std::string SstPath(uint64_t number) const { return dir_ + "/" + SstFileName(number); }
   std::string LogPath(uint64_t number) const { return dir_ + "/" + LogFileName(number); }
   std::string VlogPath(uint64_t number) const { return dir_ + "/" + VlogFileName(number); }
@@ -241,6 +269,20 @@ class DB {
   std::string dir_;
   int log_fd_ = -1;
   std::unique_ptr<log::Writer> log_writer_;
+  // Async WAL state. Only the mutex-holder touches the ring; wal_size_ is
+  // the log's absolute end offset (SQEs carry explicit offsets, so no
+  // O_APPEND); wal_pending_ keeps record buffers alive until their CQEs
+  // arrive, keyed by a monotonically increasing token.
+  std::unique_ptr<Ring> ring_;
+  bool io_uring_active_ = false;
+  std::string io_uring_reason_;  // why not active, for honest reporting
+  uint64_t wal_size_ = 0;
+  uint64_t wal_token_ = 0;
+  std::map<uint64_t, std::string> wal_pending_;
+  // A write CQE completed with an error AFTER its Put already returned
+  // (the reap happens opportunistically). Surfaced at the next
+  // durability point — MaybeSync — so the error is never swallowed.
+  Status wal_ring_error_;
   std::shared_ptr<MemTable> mem_;
   std::shared_ptr<MemTable> imm_;       // draining to L0 in the background
   uint64_t imm_log_number_ = 0;         // log holding imm_'s records

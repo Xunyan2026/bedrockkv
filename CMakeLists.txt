@@ -41,6 +41,7 @@ add_library(bedrockkv
   src/block.cpp
   src/sstable.cpp
   src/fs_util.cpp
+  src/ring.cpp
   src/vlog.cpp
   src/db.cpp
 )

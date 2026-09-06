@@ -45,6 +45,7 @@ struct Config {
   bool reuse_dir = false;
   bool vsep = false;
   size_t gc_size = 64u << 20;
+  bool io_uring = false;
   SyncMode sync_mode = SyncMode::kSyncPeriodic;
 };
 
@@ -61,6 +62,8 @@ void PrintUsage() {
       "  --sync always|periodic|never  WAL durability mode (default periodic)\n"
       "  --vsep              enable WiscKey value separation (+ vLog GC)\n"
       "  --gc_size N         vLog GC trigger in bytes (default 67108864)\n"
+      "  --io_uring          request the io_uring async path (degrades to\n"
+      "                      sync writes where unsupported — see header)\n"
       "  --reuse_dir         keep the previous directory instead of wiping\n");
 }
 
@@ -81,6 +84,7 @@ Config ParseArgs(int argc, char** argv) {
     else if (a == "--reuse_dir") c.reuse_dir = true;
     else if (a == "--vsep") c.vsep = true;
     else if (a == "--gc_size") c.gc_size = std::strtoull(next(), nullptr, 10);
+    else if (a == "--io_uring") c.io_uring = true;
     else if (a == "--sync") {
       const std::string m = next();
       if (m == "always") c.sync_mode = SyncMode::kSyncAlways;
@@ -101,6 +105,20 @@ void RemoveDirTree(const std::string& dir) {
     std::printf("failed to remove %s\n", dir.c_str());
     std::exit(1);
   }
+}
+
+// Honest environment reporting: whether the io_uring path is real here.
+void PrintEngineHeader(const DB& db, const Config& c) {
+  std::string uring = db.io_uring_active()
+                          ? "active"
+                          : "unavailable (" + db.io_uring_unavailable_reason() +
+                                ")";
+  std::printf("[config] workload=%s vsep=%s io_uring=%s sync=%s\n\n",
+              c.workload_name.c_str(), c.vsep ? "on" : "off",
+              uring.c_str(),
+              c.sync_mode == SyncMode::kSyncAlways      ? "always"
+              : c.sync_mode == SyncMode::kSyncPeriodic  ? "periodic"
+                                                        : "never");
 }
 
 std::string FormatNs(int64_t ns) {
@@ -124,6 +142,7 @@ Options BenchOptions(const Config& c) {
   o.max_sst_size = 4u << 20;
   o.enable_value_separation = c.vsep;
   o.vlog_gc_size = c.gc_size;
+  o.enable_io_uring = c.io_uring;
   return o;
 }
 
@@ -329,6 +348,7 @@ int main(int argc, char** argv) {
         std::printf("Open failed: %s\n", s.message().c_str());
         return 1;
       }
+      PrintEngineHeader(*db, one);
       RunLoad(one, db.get());
       RunWorkload(one, w, db.get());
     }
@@ -350,6 +370,7 @@ int main(int argc, char** argv) {
     std::printf("Open failed: %s\n", s.message().c_str());
     return 1;
   }
+  PrintEngineHeader(*db, c);
   RunLoad(c, db.get());
   RunWorkload(c, *w, db.get());
   return 0;
