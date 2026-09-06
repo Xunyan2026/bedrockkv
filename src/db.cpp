@@ -335,6 +335,35 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   // target. A database with no named vLogs either is fresh or predates
   // value separation — generation 1 starts the separated era.
   std::set<uint64_t> live_vlogs(ms.vlogs.begin(), ms.vlogs.end());
+  // Refuse, don't degrade: with separation off, the vLogs would neither be
+  // opened nor re-published, and the orphan sweep in step 4 would DELETE
+  // them — silent destruction of live values. The check must scan the
+  // DISK, not just the MANIFEST: a memtable pending flush means the
+  // MANIFEST can predate the newest vLog generation (it is republished
+  // only at flush/GC), so a freshly separated DB can have .vlog files on
+  // disk with an empty ms.vlogs.
+  bool vlog_on_disk = false;
+  {
+    DIR* d = ::opendir(dir.c_str());
+    if (d != nullptr) {
+      while (const dirent* e = ::readdir(d)) {
+        uint64_t n = 0;
+        if (ParseNumberedFile(e->d_name, ".vlog", &n)) {
+          vlog_on_disk = true;
+          break;
+        }
+      }
+      ::closedir(d);
+    }
+  }
+  if (vlog_on_disk && !options.enable_value_separation) {
+    return fail("directory contains value logs but enable_value_separation "
+                "is off; reopen with the switch on to avoid orphaning them");
+  }
+  if (!live_vlogs.empty() && !options.enable_value_separation) {
+    return fail("MANIFEST names value logs but enable_value_separation is "
+                "off; reopen with the switch on to avoid orphaning them");
+  }
   if (options.enable_value_separation) {
     if (live_vlogs.empty()) {
       live_vlogs.insert(1);
@@ -498,6 +527,11 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   db->log_writer_ = std::make_unique<log::Writer>(fd, log_end);
   if (db->io_uring_active_) {
     db->wal_size_ = log_end;
+  }
+  // A fresh open may have CREATED the log file (O_CREAT): persist its
+  // directory entry before anything is acknowledged into it.
+  if (const Status ds = fs::SyncDir(db->dir_); !ds.ok()) {
+    return fail("cannot sync db directory: " + ds.message());
   }
 
   // ---- 6. start the background flush/compaction thread (last: no
@@ -706,12 +740,18 @@ Status DB::WriteEntry(uint8_t type, std::string_view key,
         },
         /*wait=*/false);
   } else {
+    // Account the REAL encoded size (one header per fragment + block
+    // tail padding), not payload+header — payload.size()+kHeaderSize
+    // undercounts multi-fragment records and diverges from the async
+    // path's accounting (found by review).
+    const uint64_t before = log_writer_->file_offset();
     s = log_writer_->AddRecord(payload);
     if (!s.ok()) {
       return s;
     }
-    unsynced_bytes_ += payload.size() + log::kHeaderSize;
-    stats_wal_bytes_ += payload.size() + log::kHeaderSize;
+    const uint64_t written = log_writer_->file_offset() - before;
+    unsynced_bytes_ += written;
+    stats_wal_bytes_ += written;
   }
   if (count_user_bytes) {
     stats_user_bytes_ += key.size() + value.size();
@@ -763,8 +803,11 @@ Status DB::MaybeSync() {
       if (!p.ok()) {
         return p;
       }
+      // Reset ONLY after a sync actually ran: zeroing it unconditionally
+      // would re-zero the accumulator on every Put and kSyncPeriodic
+      // could never cross its threshold again (found by review).
+      unsynced_bytes_ = 0;
     }
-    unsynced_bytes_ = 0;
     return Status::Ok();
   }
   if (need) {
@@ -780,8 +823,8 @@ Status DB::MaybeSync() {
       return Status::IOError(std::string("log fsync failed: ") +
                              std::strerror(errno));
     }
+    unsynced_bytes_ = 0;
   }
-  unsynced_bytes_ = 0;
   return Status::Ok();
 }
 
@@ -790,7 +833,9 @@ Status DB::DrainWalRing() {
   // outstanding completion (writes and fsyncs alike) has arrived — the
   // points that call this (pre-fsync, pre-rotation, shutdown) are exactly
   // the ones after which WAL bytes must be at least in the page cache.
-  if (ring_->outstanding() == 0) {
+  // queued_>0 counts too: a previously failed enter() leaves published
+  // SQEs unsubmitted, and ignoring them could close the fd they target.
+  if (ring_->outstanding() == 0 && ring_->pending() == 0) {
     return Status::Ok();
   }
   if (!ring_->Flush(true)) {
@@ -810,10 +855,46 @@ Status DB::DrainWalRing() {
   return err;
 }
 
+Status DB::ForceDurabilityLocked() {
+  // Mutex held. A durability point the caller can rely on regardless of
+  // the user's sync mode: everything written so far is on the device
+  // when this returns Ok. Used before publishing a MANIFEST that
+  // retires data (vlog GC) — without it, kSyncNever/kSyncPeriodic could
+  // lose rewrite records while the retired generations are deleted.
+  if (io_uring_active_) {
+    const Status d = DrainWalRing();
+    if (!d.ok()) {
+      return d;
+    }
+    const Status p = SyncViaRing();  // fsyncs vLog + WAL in one pair
+    if (p.ok()) {
+      unsynced_bytes_ = 0;
+    }
+    return p;
+  }
+  if (vlog_current_ != nullptr) {
+    const Status s = vlog_current_->Sync();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (::fsync(log_fd_) != 0) {
+    return Status::IOError(std::string("log fsync failed: ") +
+                           std::strerror(errno));
+  }
+  unsynced_bytes_ = 0;
+  return Status::Ok();
+}
+
 Status DB::SyncViaRing() {
   // Mutex held; DrainWalRing already ran, so the fsyncs below claim only
   // completed writes. Two independent files, one parallel SQE pair, one
   // wait — the sequential-sync-path's two round trips collapse into one.
+  // Invariant note: the sequential path guarantees "durable WAL ⇒
+  // durable vLog" by ORDER (vLog fsync completes first). The parallel
+  // pair can persist the WAL while the vLog fsync is still in flight —
+  // but only for writes whose Put had not yet returned, so no
+  // acknowledged state can regress; vLog CRCs surface any torn tail.
   ++wal_token_;
   if (!ring_->QueueFsync(log_fd_, wal_token_)) {
     return Status::IOError("io_uring submission queue full");
@@ -872,6 +953,15 @@ Status DB::RotateForFlush() {
     next_file_number_--;
     return Status::IOError("fsync " + LogFileName(new_log) + " failed: " +
                            std::string(std::strerror(saved)));
+  }
+  // fsync(file) does not persist the file's directory entry: without
+  // SyncDir, a power cut before the next MANIFEST publish could leave
+  // this generation nonexistent while records written into it were
+  // already acknowledged (found by review).
+  if (const Status ds = fs::SyncDir(dir_); !ds.ok()) {
+    ::close(fd);
+    next_file_number_--;
+    return ds;
   }
   imm_log_number_ = log_number_;      // retired after the flush installs
   imm_sst_number_ = next_file_number_++;  // pre-allocated output number
@@ -1307,6 +1397,15 @@ Status DB::RunVlogGC() {
   //    unnamed orphans and are removed on Open.
   {
     std::lock_guard<std::mutex> lk(mutex_);
+    // Durability BEFORE retirement: the MANIFEST below un-names the old
+    // generations, and without this barrier a crash could drop the
+    // (not-yet-fsynced) rewrite records while Open deletes the retired
+    // files — turning tail loss into permanent Corruption. The fsyncs
+    // here cost one durability point per GC pass, which is rare.
+    const Status d = ForceDurabilityLocked();
+    if (!d.ok()) {
+      return d;
+    }
     for (const std::shared_ptr<VLog>& gen : retired) {
       vlogs_.erase(gen->file_number());
     }
@@ -1653,7 +1752,11 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
                  level->end());
   };
   if (source_level_index == kL0Source) {
-    newv->l0.clear();  // inputs_a was all of L0
+    // Remove exactly the compaction's inputs (by file number, like the
+    // leveled case). A plain clear() would be correct only while this is
+    // the single thread that ever adds L0 files — a trap for any future
+    // concurrent flush producer.
+    remove_numbers(&newv->l0, inputs_a);
   } else {
     remove_numbers(&newv->levels[source_level_index], inputs_a);
   }

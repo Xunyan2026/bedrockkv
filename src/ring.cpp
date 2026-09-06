@@ -1,5 +1,6 @@
 #include "bedrockkv/ring.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 
@@ -65,7 +66,11 @@ std::unique_ptr<Ring> Ring::Open(unsigned entries, Status* status) {
   ring->cq_ring_ = ::mmap(nullptr, ring->cq_ring_size_,
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           fd, static_cast<off_t>(kOffCqRing));
-  ring->sqes_size_ = entries * 64;  // sizeof(io_uring_sqe) == 64, ABI-fixed
+  ring->sqes_size_ =
+      static_cast<size_t>(params.sq_entries) * 64;  // sizeof(io_uring_sqe) == 64, ABI-fixed
+  // Size from the KERNEL-REPORTED count, not the request: the kernel
+  // rounds sq_entries up to a power of two, and indexing with the ring's
+  // real mask can reach slots past a request-sized mapping (SIGBUS).
   ring->sqes_ = ::mmap(nullptr, ring->sqes_size_, PROT_READ | PROT_WRITE,
                        MAP_SHARED | MAP_POPULATE, fd,
                        static_cast<off_t>(kOffSqes));
@@ -119,8 +124,11 @@ Ring::~Ring() {
 
 bool Ring::QueueWrite(int fd, const void* buf, size_t len, uint64_t offset,
                       uint64_t user_data) {
-  if (queued_ == entries_) {
-    return false;  // SQ full: caller must Flush() first
+  // Capacity from the KERNEL-VISIBLE head, not our queued_ counter: after
+  // a failed enter(), published-but-unconsumed SQEs stay in the ring and
+  // counting only this batch's queued_ would let new SQEs overwrite them.
+  if (sq_tail_ - *sq_head_ >= entries_) {
+    return false;  // SQ full: caller must Flush()/Reap() first
   }
   // Build the SQE in the shared array and register it in the index array.
   // (Kernel 5.6+ for IORING_OP_WRITE. The fd must NOT be O_APPEND — see
@@ -145,7 +153,7 @@ bool Ring::QueueWrite(int fd, const void* buf, size_t len, uint64_t offset,
 }
 
 bool Ring::QueueFsync(int fd, uint64_t user_data) {
-  if (queued_ == entries_) {
+  if (sq_tail_ - *sq_head_ >= entries_) {
     return false;
   }
   auto* sqe = reinterpret_cast<std::byte*>(sqes_) +
@@ -166,9 +174,14 @@ bool Ring::Flush(bool wait_all) {
   }
   const unsigned to_submit = queued_;
   const unsigned min_complete = wait_all ? outstanding_ + queued_ : 0;
-  queued_ = 0;
   if (to_submit > 0) {
-    *sq_tail_pub_ = sq_tail_;  // publish: kernel now owns the SQEs
+    // Publish with a release store: every SQE field store must be
+    // visible to the kernel before the tail that exposes them. (A
+    // std::atomic_thread_fence + plain store would be equivalent, but the
+    // fence is unavailable under -fsanitize=thread — the release store
+    // carries the same ordering and TSan understands it; on x86's TSO
+    // both compile to a plain store.)
+    __atomic_store_n(sq_tail_pub_, sq_tail_, __ATOMIC_RELEASE);
   }
   // One enter() both submits and (with GETEVENTS) waits — the batching
   // point where N syscalls collapse into one. EINTR (a signal arrived
@@ -176,6 +189,13 @@ bool Ring::Flush(bool wait_all) {
   // to retry verbatim: the kernel consumes SQEs head→tail, so the retry
   // only picks up whatever was never consumed, and a retry with
   // GETEVENTS still blocks until min_complete completions exist.
+  //
+  // queued_ is zeroed ONLY on success: a hard enter() failure leaves the
+  // SQEs published (the kernel may even have consumed some), and the
+  // next Flush() re-attempts them — its enter() submits everything
+  // between the kernel head and the published tail, and ops consumed by
+  // the failed attempt still produce their CQEs, so outstanding_ += the
+  // full batch stays correct (never undercounts).
   long rc;
   do {
     rc = ::syscall(kEnter, fd_, to_submit, min_complete,
@@ -184,6 +204,7 @@ bool Ring::Flush(bool wait_all) {
   if (rc < 0) {
     return false;
   }
+  queued_ = 0;
   outstanding_ += to_submit;  // submitted, awaiting reap (Reap decrements)
   return true;
 }

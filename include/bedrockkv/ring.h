@@ -32,6 +32,7 @@
 // fails and the caller falls back to the synchronous write path.
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <memory>
@@ -82,13 +83,23 @@ class Ring {
   // Number of submitted-but-not-yet-reaped operations.
   size_t outstanding() const { return outstanding_; }
 
+  // Number of queued-but-not-yet-submitted SQEs (e.g. published by a
+  // Flush whose enter() then failed — they will ride along on the next
+  // submit). Callers that must guarantee "everything reached the kernel"
+  // (drain-before-fsync/rotation/close) have to consider this too.
+  size_t pending() const { return queued_; }
+
   // Drains every available CQE. `fn(user_data, result)` is called for
   // each: result < 0 is the operation's -errno. Returns false if the
   // enter-for-events step failed (only when wait=true).
   template <typename Fn>
   bool Reap(Fn fn, bool wait) {
-    if (wait && outstanding_ > 0 && !Flush(false)) {
-      return false;
+    if (wait && (outstanding_ > 0 || queued_ > 0)) {
+      // Submit whatever is queued first, so outstanding_ is the true
+      // count of in-flight operations before we sleep on it.
+      if (!Flush(false)) {
+        return false;
+      }
     }
     if (wait && outstanding_ > 0) {
       // enter() with to_submit=0 and GETEVENTS: sleep until min_complete.
@@ -103,17 +114,29 @@ class Ring {
     }
     for (;;) {
       const uint32_t head = *cq_head_;
-      if (head == *cq_tail_) {
+      // Acquire load of the tail: CQE field stores by the kernel must be
+      // visible before we read them (see the matching release store of
+      // sq_tail_pub_ in Flush). A plain std::atomic_thread_fence is
+      // unavailable under -fsanitize=thread (libstdc++), so the ordering
+      // lives on the load itself via the __atomic builtin — same
+      // semantics, and TSan understands it.
+      const uint32_t tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+      if (head == tail) {
         break;  // nothing more available right now
       }
       const auto* cqe = reinterpret_cast<const Cqe*>(
           reinterpret_cast<const char*>(cq_ring_) + cq_off_.cqes +
           (head & cq_mask_) * sizeof(Cqe));
+      // Copy the fields out BEFORE publishing the slot as consumed:
+      // after cq_head_ advances, the kernel may wrap around and
+      // overwrite this slot with a new completion at any time.
+      const uint64_t ud = cqe->user_data;
+      const int32_t res = cqe->res;
       *cq_head_ = head + 1;  // publish the slot as consumed
       if (outstanding_ > 0) {
         --outstanding_;  // belt-and-braces: never let this underflow
       }
-      fn(cqe->user_data, cqe->res);
+      fn(ud, res);
     }
     return true;
   }

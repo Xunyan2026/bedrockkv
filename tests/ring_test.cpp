@@ -6,9 +6,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <sys/mman.h>
 #include <sys/utsname.h>
@@ -162,6 +164,74 @@ TEST(RingTest, ThreeWritesOneFlushAllLand) {
   EXPECT_EQ(buf, a + b + c);
   ::close(fd);
   ::unlink(path.c_str());
+}
+
+// Reap(wait=true) contract: returns only after EVERY in-flight op's CQE
+// has been delivered, including ops still queued from a previous
+// unflushed batch.
+TEST(RingTest, ReapWaitDeliversEveryCompletion) {
+  Status s = Status::Ok();
+  auto ring = Ring::Open(8, &s);
+  if (ring == nullptr) {
+    GTEST_SKIP() << "io_uring unavailable here: " << s.message();
+  }
+  const std::string path = TempPath("reapwait");
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  ASSERT_GE(fd, 0);
+  std::vector<std::string> blobs;
+  for (int i = 0; i < 5; ++i) {
+    blobs.push_back(std::string(10, static_cast<char>('a' + i)));
+    ASSERT_TRUE(ring->QueueWrite(fd, blobs.back().data(), 10,
+                                 static_cast<uint64_t>(i) * 10, i + 1));
+  }
+  // Submit WITHOUT waiting, then let the waiting reap finish the job.
+  ASSERT_TRUE(ring->Flush(false));
+  int seen = 0;
+  std::vector<uint64_t> tokens;
+  ASSERT_TRUE(ring->Reap(
+      [&](uint64_t token, int res) {
+        EXPECT_GE(res, 0);
+        ++seen;
+        tokens.push_back(token);
+      },
+      /*wait=*/true));
+  EXPECT_EQ(seen, 5);
+  EXPECT_EQ(ring->outstanding(), 0u);
+  EXPECT_EQ(ring->pending(), 0u);
+  std::sort(tokens.begin(), tokens.end());
+  EXPECT_EQ(tokens, (std::vector<uint64_t>{1, 2, 3, 4, 5}));
+  ::close(fd);
+  ::unlink(path.c_str());
+}
+
+// Error propagation contract: a failed op completes with a negative
+// result that Reap delivers verbatim (the DB turns this into a Put error
+// at its durability points).
+TEST(RingTest, FailedOpSurfacesNegativeResult) {
+  Status s = Status::Ok();
+  auto ring = Ring::Open(8, &s);
+  if (ring == nullptr) {
+    GTEST_SKIP() << "io_uring unavailable here: " << s.message();
+  }
+  // A write against a closed fd must come back as -EBADF, not vanish.
+  const int bad_fd = ::open("/dev/null", O_WRONLY);
+  ASSERT_GE(bad_fd, 0);
+  ::close(bad_fd);
+  const std::string data = "doomed";
+  ASSERT_TRUE(ring->QueueWrite(bad_fd, data.data(), data.size(), 0, 9));
+  ASSERT_TRUE(ring->Flush(true));
+  int errors = 0;
+  ASSERT_TRUE(ring->Reap(
+      [&](uint64_t token, int res) {
+        EXPECT_EQ(token, 9u);
+        EXPECT_EQ(res, -EBADF);
+        if (res < 0) {
+          ++errors;
+        }
+      },
+      /*wait=*/false));
+  EXPECT_EQ(errors, 1);
+  EXPECT_EQ(ring->outstanding(), 0u);
 }
 
 }  // namespace

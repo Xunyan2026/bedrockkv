@@ -260,6 +260,10 @@ class DB {
   // Submits an fsync pair (vLog + WAL) as parallel SQEs and waits — the
   // MaybeSync fast path when the ring is active.
   Status SyncViaRing();   // mutex held
+  // Durability point independent of the user's sync mode: WAL + vLog
+  // fsynced before the caller publishes a MANIFEST that retires data
+  // (vlog GC step 3). Mutex held.
+  Status ForceDurabilityLocked();
 
   std::string SstPath(uint64_t number) const { return dir_ + "/" + SstFileName(number); }
   std::string LogPath(uint64_t number) const { return dir_ + "/" + LogFileName(number); }

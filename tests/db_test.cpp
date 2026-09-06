@@ -756,6 +756,29 @@ TEST(DBTest, VlogGcReclaimsGarbageKeepsLive) {
 // fine on the synchronous path, report why, and behave identically; on
 // an io_uring host the async WAL + parallel-fsync path must be exercised
 // by every operation below. Either way the full model check runs.
+// Regression (found by review): a value-separated database reopened with
+// enable_value_separation=false would silently orphan its vLogs — the
+// next Open deletes them as "orphans" and every separated value is gone.
+// Open must REFUSE instead of degrade into destruction.
+TEST(DBTest, RefusesToOpenSeparatedDbWithSeparationOff) {
+  const std::string dir = FreshDBDir("db_vsep_refusal");
+  {
+    auto db = DB::Open(dir, SeparationOptions(64u << 10));
+    ASSERT_NE(db, nullptr);
+    // Large enough to be separated (default threshold 1024).
+    ASSERT_TRUE(db->Put("big", std::string(4096, 'x')).ok());
+  }
+  Options off;
+  auto db = DB::Open(dir, off);
+  EXPECT_EQ(db, nullptr);
+  // The switch back on must still work: nothing was destroyed.
+  db = DB::Open(dir, SeparationOptions(64u << 10));
+  ASSERT_NE(db, nullptr);
+  std::string v;
+  EXPECT_TRUE(db->Get("big", &v).ok());
+  EXPECT_EQ(v, std::string(4096, 'x'));
+}
+
 TEST(DBTest, IoUringOptionDegradesOrActivates) {
   const std::string dir = FreshDBDir("db_uring");
   Options opts = SeparationOptions(64u << 10);

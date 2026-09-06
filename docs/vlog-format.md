@@ -70,3 +70,38 @@ trigger is crossed with the background thread asleep and no future event
 ever evaluates the predicate, and every caller of
 `wait_for_background_work()` blocks forever. Condition-variable protocols
 need a notify on BOTH sides of every cross-thread dependency.
+
+## Known limitations (audited, deliberately deferred)
+
+Found during a full-codebase bug sweep; each is real but bounded, and the
+fix for the first two changes core recovery semantics, so they are
+documented rather than patched on a quiet weekend:
+
+1. **Replay floor vs. pending immutable memtable.** Compaction/GC step 3
+   can publish a MANIFEST whose log number (replay floor) advances past a
+   log generation that still holds the records of an immutable memtable
+   not yet flushed (leveldb avoids this with an explicit
+   `min(log_number_, imm_log_number_)` floor). Window: a crash between
+   that MANIFEST write and the flush of the pending immutable memtable
+   loses its records. Same structural tradeoff leveldb made; fixing it
+   means threading `imm_log_number_` through every MANIFEST publication.
+2. **GC vs. pre-GC snapshot readers.** A `Scan`/iterator that copied its
+   version before a GC pass can hit a pointer into a generation the GC
+   has already unpublished; the read then reports Corruption instead of
+   the old value (the memtable-liveness check above makes *user
+   overwrites* safe; *GC rewrites* of the very entry being read are the
+   residual race). A graveyard list of retired generations until no
+   reader can hold them closes this.
+3. **Failed GC pass busy-retries.** A GC that fails early (e.g. a vLog
+   open error) re-enters every ~200 ms background wakeup and rotates an
+   empty generation each time, until it succeeds.
+4. **Memtable growth during GC.** While the background thread runs GC
+   (which never drains the memtable), an active writer can grow the
+   memtable past `write_buffer_size`; it flushes when the GC finishes.
+5. **Background errors are recorded, not raised.** A failed flush or
+   compaction sets `last_error_`/disables compaction but `Put` keeps
+   succeeding (WAL is still durable; reads go stale). Surfacing this as
+   a `Put` error, leveldb-style, is a one-line API decision away.
+6. **`RotateForFlush` leaves a stale `wal_ring_error_`.** The error is
+   surfaced at the next durability point, so nothing is lost — but the
+   rotation itself does not clear it.
