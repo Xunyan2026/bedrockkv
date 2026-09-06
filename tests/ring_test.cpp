@@ -169,7 +169,7 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
   };
 
   // Stage 1: single write at offset 0.
-  ::ftruncate(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 0), 0);
   const std::string a = "AAAAAAAAAA";
   ASSERT_TRUE(ring->QueueWrite(fd, a.data(), a.size(), 0, 1));
   ASSERT_TRUE(ring->Flush(true));
@@ -177,7 +177,7 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
   dump("stage1-single-off0", 32);
 
   // Stage 2: single write at offset 5.
-  ::ftruncate(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 0), 0);
   const std::string b = "BBBBBBBBBB";
   ASSERT_TRUE(ring->QueueWrite(fd, b.data(), b.size(), 5, 2));
   ASSERT_TRUE(ring->Flush(true));
@@ -185,7 +185,7 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
   dump("stage2-single-off5", 32);
 
   // Stage 3: two writes in one flush (the failing shape).
-  ::ftruncate(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 0), 0);
   const std::string c = "CCCCCCCCCC";
   const std::string d = "DDDDDDDDDD";
   ASSERT_TRUE(ring->QueueWrite(fd, c.data(), c.size(), 0, 3));
@@ -195,7 +195,7 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
   dump("stage3-two-oneflush", 32);
 
   // Stage 4: two writes with a flush between them.
-  ::ftruncate(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 0), 0);
   const std::string e = "EEEEEEEEEE";
   const std::string f = "FFFFFFFFFF";
   ASSERT_TRUE(ring->QueueWrite(fd, e.data(), e.size(), 0, 5));
@@ -207,7 +207,7 @@ TEST(RingTest, DIAGNOSTIC_OffsetProbe) {
   dump("stage4-two-sepflush", 32);
 
   // Stage 5: non-sparse file — pre-fill with 'Z', overwrite at 0.
-  ::ftruncate(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 0), 0);
   std::string z(32, 'Z');
   ASSERT_EQ(::pwrite(fd, z.data(), z.size(), 0), 32);
   const std::string g = "GGGGGGGGGG";
