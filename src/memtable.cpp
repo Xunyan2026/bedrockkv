@@ -69,4 +69,52 @@ bool MemTable::Comparator::operator()(const std::string& a,
          GetFixed64(b.data() + kLenPrefixSize + blen);  // tag desc: newest first
 }
 
+std::unique_ptr<Iterator> MemTable::NewIterator() const {
+  return std::make_unique<MemTableIterator>(this);
+}
+
+// ---- MemTableIterator ----
+
+MemTableIterator::MemTableIterator(const MemTable* mem)
+    : it_(std::make_unique<ListIterator>(&mem->list_)) {}
+
+void MemTableIterator::Decode() {
+  if (!it_->Valid()) {
+    valid_ = false;
+    return;
+  }
+  const std::string& entry = it_->key();
+  const uint32_t klen = GetFixed32(entry.data());
+  const size_t tag_off = MemTable::kLenPrefixSize + klen;
+  const uint64_t tag = GetFixed64(entry.data() + tag_off);
+  key_buf_.assign(entry, MemTable::kLenPrefixSize, klen);
+  PutFixed64(&key_buf_, tag);
+  value_ = std::string_view(entry.data() + tag_off + MemTable::kTagSize,
+                            entry.size() - tag_off - MemTable::kTagSize);
+  valid_ = true;
+}
+
+void MemTableIterator::SeekToFirst() {
+  it_->SeekToFirst();
+  Decode();
+}
+
+void MemTableIterator::Seek(std::string_view target) {
+  // Target is an internal key (user ++ tag). Rebuild the skiplist entry
+  // encoding around it — the comparator ignores the value tail, so a
+  // value-less entry seeks correctly.
+  constexpr size_t kTag = 8;
+  std::string entry;
+  PutFixed32(&entry, static_cast<uint32_t>(target.size() - kTag));
+  entry.append(target.substr(0, target.size() - kTag));
+  entry.append(target.substr(target.size() - kTag));
+  it_->Seek(entry);
+  Decode();
+}
+
+void MemTableIterator::Next() {
+  it_->Next();
+  Decode();
+}
+
 }  // namespace bedrockkv

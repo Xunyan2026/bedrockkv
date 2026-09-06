@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bedrockkv/encoding.h"
 #include "bedrockkv/status.h"
 
 namespace bedrockkv {
@@ -26,6 +27,20 @@ namespace bedrockkv {
 struct InternalKeyComparator {
   bool operator()(std::string_view a, std::string_view b) const;
 };
+
+// Splits an internal key into its parts (defensive: short keys are
+// treated as bare user keys with tag 0).
+inline std::string_view ExtractUserKey(std::string_view internal_key) {
+  return internal_key.size() >= 8
+             ? internal_key.substr(0, internal_key.size() - 8)
+             : internal_key;
+}
+
+inline uint64_t ExtractTag(std::string_view internal_key) {
+  return internal_key.size() >= 8
+             ? GetFixed64(internal_key.data() + internal_key.size() - 8)
+             : 0;
+}
 
 class BlockBuilder {
  public:

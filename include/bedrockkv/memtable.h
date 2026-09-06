@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "bedrockkv/encoding.h"
+#include "bedrockkv/iterator.h"
 #include "bedrockkv/skiplist.h"
 
 namespace bedrockkv {
@@ -49,6 +50,12 @@ class MemTable {
   size_t ApproximateSize() const { return approximate_size_; }
   size_t Count() const { return list_.ApproximateSize(); }
 
+  // Ordered iteration for Scan / flush. The memtable must outlive the
+  // iterator; iteration is read-only and safe alongside a concurrent
+  // writer (the skiplist reader protocol) — but not alongside a flush,
+  // which is why readers snapshot the shared_ptr first.
+  std::unique_ptr<Iterator> NewIterator() const;
+
   // Invokes fn(seq, type, key, value) for every entry in memtable order:
   // user key ascending, newest version first — exactly the order an SST
   // requires. Decoding is the inverse of Put/Delete's encoding.
@@ -70,6 +77,8 @@ class MemTable {
   static constexpr size_t kLenPrefixSize = 4;
   static constexpr size_t kTagSize = 8;
 
+  friend class MemTableIterator;
+
   struct Comparator {
     // a < b  <=>  (user key of a) < (user key of b), or equal user keys
     // and a's tag is NEWER (numerically larger). Ignores the value tail.
@@ -79,6 +88,37 @@ class MemTable {
 
   List list_;
   size_t approximate_size_ = 0;
+};
+
+}  // namespace bedrockkv
+
+// Defined out-of-line (needs MemTable's private skiplist type); declared
+// after the class so MemTable::NewIterator can name it.
+namespace bedrockkv {
+
+// Iterates a MemTable yielding internal keys (user_key ++ tag). The
+// skiplist stores whole entries ([klen][key][tag][value]); the iterator
+// decodes key and value apart on every step.
+class MemTableIterator : public Iterator {
+ public:
+  explicit MemTableIterator(const MemTable* mem);
+
+  bool Valid() const override { return valid_; }
+  void SeekToFirst() override;
+  void Seek(std::string_view target) override;
+  void Next() override;
+  std::string_view key() const override { return key_buf_; }
+  std::string_view value() const override { return value_; }
+
+ private:
+  void Decode();
+
+  friend class MemTable;
+  using ListIterator = MemTable::List::Iterator;
+  std::unique_ptr<ListIterator> it_;  // unique type: hidden from callers
+  std::string key_buf_;               // user_key ++ tag
+  std::string_view value_;            // points into the skiplist node
+  bool valid_ = false;
 };
 
 }  // namespace bedrockkv

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "bedrockkv/block.h"
+#include "bedrockkv/iterator.h"
 #include "bedrockkv/memtable.h"  // kTypeValue / kTypeDeletion / Lookup
 #include "bedrockkv/status.h"
 
@@ -40,9 +41,11 @@ struct TableOptions {
 // MANIFEST; Table itself only re-derives the key range and entry count.
 struct FileMeta {
   uint64_t file_number = 0;
+  uint32_t level = 0;  // 0 = L0 (overlapping), 1..kMaxLevels-1 = leveled
   uint64_t smallest_seq = 0;
   uint64_t largest_seq = 0;
   uint64_t entry_count = 0;
+  uint64_t file_size = 0;
   std::string smallest_key;  // user keys
   std::string largest_key;
 };
@@ -61,6 +64,11 @@ class Builder {
   Status Finish(const std::string& path, FileMeta* meta);
 
   uint64_t num_entries() const { return num_entries_; }
+  // Current on-disk size estimate while building (sealed blocks + the
+  // in-progress one) — its only consumer is compaction output splitting.
+  uint64_t ApproximateFileSize() const {
+    return file_.size() + data_block_.CurrentSizeEstimate();
+  }
 
  private:
   // Seals the current data block: emits it, its Bloom filter, and its
@@ -105,6 +113,13 @@ class Table {
   const std::string& smallest_user_key() const { return smallest_user_key_; }
   const std::string& largest_user_key() const { return largest_user_key_; }
   uint64_t num_entries() const { return num_entries_; }
+  // Full on-disk size (the whole file lives in memory).
+  size_t size() const { return file_data_.size(); }
+
+  // Entries in internal-key order across all data blocks. The table must
+  // outlive the iterator (it does: tables are immutable and shared_ptr-
+  // kept alive by the Version snapshot the iterator is built from).
+  std::unique_ptr<Iterator> NewIterator() const;
 
  private:
   struct IndexEntry {
@@ -112,6 +127,7 @@ class Table {
     uint64_t offset = 0;
     uint32_t size = 0;
   };
+  friend class TableIterator;
   bool KeyMayMatchInBlock(size_t block_index,
                           std::string_view user_key) const;
 
@@ -122,6 +138,29 @@ class Table {
   std::string smallest_user_key_;
   std::string largest_user_key_;
   uint64_t num_entries_ = 0;
+};
+
+// Walks every data block of a Table in internal-key order.
+class TableIterator : public Iterator {
+ public:
+  explicit TableIterator(const Table* table);
+
+  bool Valid() const override { return valid_; }
+  void SeekToFirst() override;
+  void Seek(std::string_view target) override;
+  void Next() override;
+  std::string_view key() const override { return block_.key(); }
+  std::string_view value() const override { return block_.value(); }
+
+ private:
+  // Positions on data block `index`; advances past any empty tail.
+  void EnterBlock(size_t index, bool seek_first);
+
+  const Table* table_;
+  size_t block_index_ = 0;
+  Block block_;  // re-seated on every block transition
+  bool valid_ = false;
+  bool corrupted_ = false;
 };
 
 }  // namespace bedrockkv::sst

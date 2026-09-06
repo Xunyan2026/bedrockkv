@@ -123,11 +123,12 @@ Status Builder::Finish(const std::string& path, FileMeta* meta) {
   file_ += footer;
 
   if (meta != nullptr) {
-    // file_number is assigned by the caller (DB / MANIFEST) — Finish
-    // must not touch it.
+    // file_number / level are assigned by the caller (DB / MANIFEST) —
+    // Finish must not touch them.
     meta->smallest_seq = smallest_seq_;
     meta->largest_seq = largest_seq_;
     meta->entry_count = num_entries_;
+    meta->file_size = file_.size();
     meta->smallest_key = smallest_user_key_;
     meta->largest_key = largest_user_key_;
   }
@@ -212,8 +213,25 @@ std::shared_ptr<Table> Table::Open(uint64_t file_number,
   if (table->index_.empty()) {
     return fail("no data blocks");
   }
-  table->smallest_user_key_ = std::string(UserKeyOf(table->index_.front().key));
   table->largest_user_key_ = std::string(UserKeyOf(table->index_.back().key));
+  // The smallest key is NOT the index's first entry — index entries hold
+  // the LAST key of each block. Decode the first data block and take its
+  // first entry (leveldb does the same). Skipping this made every file's
+  // smallest key look like "the key ~one block into the file", which
+  // leveled-compaction binary search then misread as an empty left side.
+  {
+    Block first_block(std::string_view(table->file_data_)
+                          .substr(table->index_.front().offset,
+                                  table->index_.front().size));
+    if (first_block.corrupted()) {
+      return fail("first data block corrupt");
+    }
+    first_block.SeekToFirst();
+    if (!first_block.Valid()) {
+      return fail("first data block empty");
+    }
+    table->smallest_user_key_ = std::string(UserKeyOf(first_block.key()));
+  }
   table->filter_block_ =
       std::string_view(table->file_data_).substr(filter_offset, filter_size);
 
@@ -303,6 +321,86 @@ MemTable::Lookup Table::Get(std::string_view user_key, std::string* value,
     return MemTable::Lookup::kDeleted;
   }
   return MemTable::Lookup::kMissing;
+}
+
+// ---- TableIterator ----
+
+TableIterator::TableIterator(const Table* table)
+    : table_(table), block_(std::string_view()) {}
+
+std::unique_ptr<Iterator> Table::NewIterator() const {
+  return std::make_unique<TableIterator>(this);
+}
+
+void TableIterator::EnterBlock(size_t index, bool seek_first) {
+  block_index_ = index;
+  block_ = Block(std::string_view(table_->file_data_)
+                     .substr(table_->index_[index].offset,
+                             table_->index_[index].size));
+  if (block_.corrupted()) {
+    corrupted_ = true;
+    valid_ = false;
+    return;
+  }
+  if (seek_first) {
+    block_.SeekToFirst();
+  }
+  valid_ = block_.Valid();
+}
+
+void TableIterator::SeekToFirst() {
+  corrupted_ = false;
+  if (table_->index_.empty()) {
+    valid_ = false;
+    return;
+  }
+  EnterBlock(0, /*seek_first=*/true);
+}
+
+void TableIterator::Seek(std::string_view target) {
+  corrupted_ = false;
+  // First block whose last key >= target: the only one that can hold it.
+  const InternalKeyComparator less;
+  auto it = std::lower_bound(
+      table_->index_.begin(), table_->index_.end(), target,
+      [&less](const Table::IndexEntry& e, std::string_view t) {
+        return less(e.key, t);
+      });
+  if (it == table_->index_.end()) {
+    valid_ = false;
+    return;
+  }
+  EnterBlock(static_cast<size_t>(it - table_->index_.begin()),
+             /*seek_first=*/false);
+  if (corrupted_) {
+    return;
+  }
+  // A freshly seated block is UNPOSITIONED (Valid() is false until the
+  // first positioning call), so Seek must run before reading valid_ —
+  // checking Valid() first silently disabled every non-initial Seek.
+  block_.Seek(target);
+  valid_ = block_.Valid();
+}
+
+void TableIterator::Next() {
+  if (!valid_) {
+    return;
+  }
+  block_.Next();
+  if (block_.corrupted()) {
+    corrupted_ = true;
+    valid_ = false;
+    return;
+  }
+  if (block_.Valid()) {
+    return;  // same block, next entry
+  }
+  // Move to the next data block (every sealed block holds >= 1 entry).
+  if (block_index_ + 1 >= table_->index_.size()) {
+    valid_ = false;
+    return;
+  }
+  EnterBlock(block_index_ + 1, /*seek_first=*/true);
 }
 
 }  // namespace bedrockkv::sst

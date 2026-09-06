@@ -229,6 +229,9 @@ TEST(DBTest, FlushWritesSstAndServesReadsAfterReopen) {
   const std::string dir = FreshDBDir("db_flush");
   Options opts;
   opts.write_buffer_size = 64 * 1024;  // flush every ~64KB of entries
+  // This test pins the OLD flush-only semantics (L0 grows, nothing
+  // compacted); the compaction model test covers the leveled path.
+  opts.l0_compaction_trigger = 1000;
   uint64_t flushed_seq = 0;
   {
     auto db = DB::Open(dir, opts);
@@ -236,7 +239,8 @@ TEST(DBTest, FlushWritesSstAndServesReadsAfterReopen) {
     for (uint64_t i = 0; i < 2000; ++i) {
       ASSERT_TRUE(db->Put(Key(i), std::string(60, 'v')).ok());
     }
-    EXPECT_GE(db->l0_file_count(), 2u) << "flush never triggered";
+    db->wait_for_background_work();
+    EXPECT_GE(db->level_file_count(0), 2u) << "flush never triggered";
     EXPECT_GT(db->log_number(), 1u) << "log never rotated";
     flushed_seq = db->latest_seq();
     std::string v;
@@ -246,7 +250,7 @@ TEST(DBTest, FlushWritesSstAndServesReadsAfterReopen) {
   // The old logs must be gone; only SSTs + the current log remain.
   auto db = DB::Open(dir, opts);
   ASSERT_NE(db, nullptr);
-  EXPECT_GE(db->l0_file_count(), 2u);
+  EXPECT_GE(db->level_file_count(0), 2u);
   std::string v;
   for (uint64_t i = 0; i < 2000; i += 17) {
     ASSERT_TRUE(db->Get(Key(i), &v).ok()) << "lost key " << i;
@@ -260,6 +264,8 @@ TEST(DBTest, VersionsAcrossFlushBoundary) {
   const std::string dir = FreshDBDir("db_versions");
   Options opts;
   opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 1000;  // L0 must accumulate: pin flush-only
+  opts.level_base_size = 1u << 30;    // semantics for this test
   auto db = DB::Open(dir, opts);
   ASSERT_NE(db, nullptr);
   std::string v;
@@ -267,7 +273,7 @@ TEST(DBTest, VersionsAcrossFlushBoundary) {
   // v1 lands in an SST, v2 in the memtable: the memtable must win.
   EXPECT_TRUE(db->Put("k", "v1").ok());
   uint64_t filler = 0;
-  while (db->l0_file_count() == 0) {
+  while (db->level_file_count(0) == 0) {
     ASSERT_TRUE(db->Put(Key(filler++), std::string(100, 'f')).ok());
   }
   EXPECT_TRUE(db->Put("k", "v2").ok());
@@ -287,11 +293,11 @@ TEST(DBTest, VersionsAcrossFlushBoundary) {
   // And an SST tombstone must shadow an older SST value even after both
   // are flushed and the process restarted.
   EXPECT_TRUE(db->Put("k", "v3").ok());
-  while (db->l0_file_count() < 3) {
+  while (db->level_file_count(0) < 3) {
     ASSERT_TRUE(db->Put(Key(filler++), std::string(100, 'f')).ok());
   }
   EXPECT_TRUE(db->Delete("k").ok());
-  while (db->l0_file_count() < 4) {
+  while (db->level_file_count(0) < 4) {
     ASSERT_TRUE(db->Put(Key(filler++), std::string(100, 'f')).ok());
   }
   db.reset();
@@ -337,7 +343,13 @@ TEST(DBTest, ModelTestWithFlushesAgainstStdMap) {
         }
       }
     }
-    EXPECT_GE(db->l0_file_count(), 5u) << "test never exercised flushes";
+    // Compaction collapses the flush output (correctly), so instead of
+    // counting files assert the mechanics ran: the log rotated many times
+    // and compaction moved data into L1.
+    db->wait_for_background_work();
+    EXPECT_GT(db->log_number(), 1u) << "log never rotated";
+    EXPECT_GE(db->level_file_count(1), 1u)
+        << "nothing was ever compacted into L1";
   }
 
   // Reopen: the oracle must survive exactly, served from SSTs + log.
@@ -353,6 +365,185 @@ TEST(DBTest, ModelTestWithFlushesAgainstStdMap) {
     if (oracle.count(key) == 0) {
       EXPECT_TRUE(IsNotFound(db->Get(key, &v)));
     }
+  }
+}
+
+// ---- stage-2 second batch: Scan, compaction, regressions ----
+
+TEST(DBTest, ScanRangesTombstonesAndBoundaries) {
+  auto db = DB::Open(FreshDBDir("db_scan"));
+  ASSERT_NE(db, nullptr);
+
+  EXPECT_TRUE(db->Put("a", "1").ok());
+  EXPECT_TRUE(db->Put("b", "2").ok());
+  EXPECT_TRUE(db->Put("c", "3").ok());
+  EXPECT_TRUE(db->Put("d", "4").ok());
+  EXPECT_TRUE(db->Delete("c").ok());
+  EXPECT_TRUE(db->Put("b", "2b").ok());  // overwrite: scan must see 2b
+
+  // Collect [begin, end) results.
+  const auto scan = [&](const char* begin, const char* end) {
+    std::vector<std::pair<std::string, std::string>> out;
+    EXPECT_TRUE(db->Scan(begin, end,
+                         [&](std::string_view k, std::string_view v) {
+                           out.emplace_back(k, v);
+                         }).ok());
+    return out;
+  };
+
+  // Full range: tombstoned c skipped, newest b wins.
+  const auto all = scan("a", "z");
+  ASSERT_EQ(all.size(), 3u);
+  EXPECT_EQ(all[0].first, "a");
+  EXPECT_EQ(all[1].first, "b");
+  EXPECT_EQ(all[1].second, "2b");
+  EXPECT_EQ(all[2].first, "d");
+
+  // Half-open boundaries: [b, d) excludes d, includes b.
+  const auto mid = scan("b", "d");
+  ASSERT_EQ(mid.size(), 1u);
+  EXPECT_EQ(mid[0].first, "b");
+
+  // begin == end is empty; begin past everything is empty.
+  EXPECT_TRUE(scan("c", "c").empty());
+  EXPECT_TRUE(scan("x", "z").empty());
+}
+
+// Scan against an std::map oracle while flushes and compactions run
+// underneath (tiny thresholds so L0 -> L1 -> L2 all get exercised).
+TEST(DBTest, ScanMatchesStdMapAcrossFlushesAndCompactions) {
+  const std::string dir = FreshDBDir("db_scan_model");
+  Options opts;
+  opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 64 * 1024;
+  opts.max_sst_size = 16 * 1024;
+  TestRng rng(20260908);
+  std::map<std::string, std::string> oracle;
+
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  const int kOps = 12000;
+  const uint64_t kKeySpace = 600;
+  for (int i = 0; i < kOps; ++i) {
+    const std::string key = "k" + std::to_string(rng.Uniform(kKeySpace));
+    const int roll = static_cast<int>(rng.Uniform(100));
+    if (roll < 55) {
+      const std::string value = "v" + std::to_string(rng.Uniform(100000));
+      ASSERT_TRUE(db->Put(key, value).ok());
+      oracle[key] = value;
+    } else if (roll < 70) {
+      ASSERT_TRUE(db->Delete(key).ok());
+      oracle.erase(key);
+    } else if (roll < 90) {
+      // Random range scan, verified against the oracle.
+      const uint64_t lo = rng.Uniform(kKeySpace);
+      const uint64_t hi = lo + rng.Uniform(80);
+      std::map<std::string, std::string> got;
+      ASSERT_TRUE(
+          db->Scan("k" + std::to_string(lo), "k" + std::to_string(hi),
+                   [&](std::string_view k, std::string_view v) {
+                     got.emplace(k, v);
+                   }).ok());
+      std::map<std::string, std::string> want;
+      for (auto it = oracle.lower_bound("k" + std::to_string(lo));
+           it != oracle.end() && it->first < "k" + std::to_string(hi); ++it) {
+        want.emplace(it->first, it->second);
+      }
+      EXPECT_EQ(got, want) << "op " << i << " scan [" << lo << ", " << hi << ")";
+    } else {
+      std::string v;
+      const Status s = db->Get(key, &v);
+      const auto it = oracle.find(key);
+      if (it == oracle.end()) {
+        EXPECT_TRUE(IsNotFound(s)) << "op " << i;
+      } else {
+        ASSERT_TRUE(s.ok()) << "op " << i;
+        EXPECT_EQ(v, it->second) << "op " << i;
+      }
+    }
+  }
+  db->wait_for_background_work();
+  EXPECT_GE(db->level_file_count(1), 1u)
+      << "compaction never moved anything into L1";
+
+  // Full-range scan after everything settled.
+  std::map<std::string, std::string> got;
+  ASSERT_TRUE(db->Scan("", "\xff", [&](std::string_view k, std::string_view v) {
+    got.emplace(k, v);
+  }).ok());
+  EXPECT_EQ(got, oracle);
+
+  // And the whole oracle survives a reopen.
+  db.reset();
+  db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  std::string v;
+  for (const auto& [key, expected] : oracle) {
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost key " << key;
+    EXPECT_EQ(v, expected) << "wrong value for " << key;
+  }
+}
+
+// REGRESSION (stage-2 bug): DB::Open deleted every log the MANIFEST did
+// not name. With a memtable still pending flush, its records lived only
+// in the retired log — the reopen lost them. The MANIFEST's log number
+// is now a replay floor and recovery replays every log >= the floor.
+TEST(DBTest, ReopenWithPendingFlushKeepsRetiredLogs) {
+  const std::string dir = FreshDBDir("db_pending_flush");
+  Options opts;
+  opts.write_buffer_size = 8 * 1024;
+  opts.l0_compaction_trigger = 1000;  // keep SSTs in L0: pure flush test
+  {
+    auto db = DB::Open(dir, opts);
+    ASSERT_NE(db, nullptr);
+    for (int i = 0; i < 20000; ++i) {
+      ASSERT_TRUE(db->Put("key" + std::to_string(i), std::string(100, 'v'))
+                      .ok());
+    }
+    // No wait_for_background_work: destroy while a flush may still be
+    // pending. The retired log holding the immutable memtable's records
+    // must survive and be replayed.
+  }
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  std::string v;
+  for (int i = 0; i < 20000; ++i) {
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &v).ok())
+        << "lost key" << i;
+  }
+}
+
+// REGRESSION (stage-2 bug): Table::Open derived smallest_user_key_ from
+// the index's first entry — the LAST key of the first data block. Leveled
+// compaction then binary-searched with a wrong left boundary and skipped
+// files whose real first key sorted before that. Any model test with
+// compaction catches it; this one uses an adversarial key layout where
+// the first block's last key is lexicographically FAR from the file's
+// first key ("key0" vs "key10026"-style gaps).
+TEST(DBTest, LeveledLookupAfterCompactionFindsSmallKeys) {
+  const std::string dir = FreshDBDir("db_leveled_smallkeys");
+  Options opts;
+  opts.write_buffer_size = 8 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 32 * 1024;
+  opts.max_sst_size = 32 * 1024;
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  // Lexicographic order clusters these so one data block spans a huge
+  // lexicographic range: key0, key1, key10, key100, ...
+  for (uint64_t i = 0; i < 5000; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::to_string(i), std::string(80, 'v')).ok());
+  }
+  db->wait_for_background_work();
+  ASSERT_GE(db->level_file_count(1), 1u) << "no L1 file after compaction";
+
+  std::string v;
+  for (uint64_t i = 0; i < 5000; ++i) {
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &v).ok())
+        << "lost key" << i << " after compaction";
+    EXPECT_EQ(v, std::string(80, 'v'));
   }
 }
 

@@ -18,6 +18,9 @@ target_link_libraries(db_test PRIVATE bedrockkv GTest::gtest_main)
 add_executable(memtable_test memtable_test.cpp)
 target_link_libraries(memtable_test PRIVATE bedrockkv GTest::gtest_main)
 
+add_executable(iterator_test iterator_test.cpp)
+target_link_libraries(iterator_test PRIVATE bedrockkv GTest::gtest_main)
+
 add_executable(sstable_test sstable_test.cpp)
 target_link_libraries(sstable_test PRIVATE bedrockkv GTest::gtest_main)
 
@@ -28,4 +31,5 @@ gtest_discover_tests(crc32_test)
 gtest_discover_tests(log_test)
 gtest_discover_tests(db_test)
 gtest_discover_tests(memtable_test)
+gtest_discover_tests(iterator_test)
 gtest_discover_tests(sstable_test)
