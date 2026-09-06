@@ -46,6 +46,7 @@
 // replayed). A generation is deleted only once the floor moves past it.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -146,6 +147,17 @@ class DB {
   // memtable and satisfied all compaction triggers (tests/benchmarks).
   void wait_for_background_work();
 
+  // ---- benchmark instrumentation (relaxed atomics; diagnostics only) ----
+  // Write amplification = (wal_bytes_written + sst_bytes_written) /
+  // user_bytes_written: every logical byte the user asked us to persist
+  // vs. every physical byte we sent to the filesystem for it. The split
+  // (WAL vs SST) makes flush/compaction contributions visible separately.
+  uint64_t wal_bytes_written() const { return stats_wal_bytes_.load(std::memory_order_relaxed); }
+  uint64_t sst_bytes_written() const { return stats_sst_bytes_.load(std::memory_order_relaxed); }
+  uint64_t user_bytes_written() const { return stats_user_bytes_.load(std::memory_order_relaxed); }
+  uint64_t flush_count() const { return stats_flushes_.load(std::memory_order_relaxed); }
+  uint64_t compaction_count() const { return stats_compactions_.load(std::memory_order_relaxed); }
+
  private:
   DB() = default;
 
@@ -191,6 +203,14 @@ class DB {
 
   uint64_t next_file_number_ = 1;
   uint64_t log_number_ = 0;
+
+  // Diagnostics counters (see the accessors above). Relaxed is enough:
+  // they are observability, never read back to make decisions.
+  std::atomic<uint64_t> stats_wal_bytes_{0};
+  std::atomic<uint64_t> stats_sst_bytes_{0};
+  std::atomic<uint64_t> stats_user_bytes_{0};
+  std::atomic<uint64_t> stats_flushes_{0};
+  std::atomic<uint64_t> stats_compactions_{0};
 
   // Background machinery.
   mutable std::mutex mutex_;

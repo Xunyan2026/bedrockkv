@@ -45,6 +45,12 @@ add_library(bedrockkv
 )
 target_include_directories(bedrockkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# ---- Benchmarks ----------------------------------------------------------
+# Not part of ctest: long-running by design. Run manually, e.g.
+#   ./build/ycsb_bench --workload all
+add_executable(ycsb_bench bench/ycsb_bench.cpp)
+target_link_libraries(ycsb_bench PRIVATE bedrockkv)
+
 # ---- Tests ---------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests)

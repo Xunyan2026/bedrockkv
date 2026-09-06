@@ -528,6 +528,8 @@ Status DB::WriteEntry(uint8_t type, std::string_view key,
     return s;
   }
   unsynced_bytes_ += payload.size() + log::kHeaderSize;
+  stats_wal_bytes_ += payload.size() + log::kHeaderSize;
+  stats_user_bytes_ += key.size() + value.size();
   s = MaybeSync();
   if (!s.ok()) {
     return s;
@@ -861,6 +863,8 @@ Status DB::FlushImmMemTable(const std::shared_ptr<MemTable>& imm,
     ::unlink(SstPath(sst_number).c_str());
     return s;
   }
+  stats_sst_bytes_ += meta.file_size;
+  stats_flushes_ += 1;
 
   // Install under the mutex. Order is the crash story: MANIFEST names
   // the new SST and the CURRENT (post-rotation) log; only after it is
@@ -1021,6 +1025,7 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
       return;
     }
     outputs.push_back(TableRef{std::move(table), meta});
+    stats_sst_bytes_ += meta.file_size;
     builder = sst::Builder{};
     builder_used = false;
   };
@@ -1094,6 +1099,7 @@ Status DB::RunCompaction(std::vector<TableRef> inputs_a,
   if (!s.ok()) {
     return s;  // inputs still published; outputs are future orphans
   }
+  stats_compactions_ += 1;
   for (const TableRef& r : inputs_a) {
     ::unlink(SstPath(r.meta.file_number).c_str());
   }
