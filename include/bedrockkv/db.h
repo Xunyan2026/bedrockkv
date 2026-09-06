@@ -267,6 +267,13 @@ class DB {
   // triggers on file size alone; afterwards the floor keeps GC from
   // rewriting mostly-live files forever (see VlogGcNeeded).
   uint64_t vlog_gc_floor_ = 0;
+  // True while the background thread is inside RunVlogGC. The last step
+  // of a pass first unpublishes the old generations and only then bumps
+  // the GC counter, so between those points VlogGcNeeded() is false
+  // while the GC is still finishing — wait_for_background_work would
+  // return early and observers could see a stale gc count / old file.
+  // The flag closes that window (mutex-held, like everything it guards).
+  bool vlog_gc_active_ = false;
   // Read cache for separated values: key = encoded 21-byte pointer,
   // weight = value bytes. Sharded + internally locked, so Get/Scan may
   // touch it after releasing mutex_ — hence mutable under const methods.

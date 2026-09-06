@@ -1217,9 +1217,11 @@ void DB::BackgroundLoop() {
       continue;
     }
     if (VlogGcNeeded()) {
+      vlog_gc_active_ = true;
       lk.unlock();
       const Status s = RunVlogGC();
       lk.lock();
+      vlog_gc_active_ = false;
       if (!s.ok()) {
         // GC is also best-effort: the old generation stays published and
         // nothing is lost, just not yet reclaimed. Back off like the
@@ -1548,8 +1550,8 @@ void DB::wait_for_background_work() {
   std::unique_lock<std::mutex> lk(mutex_);
   signal_.notify_all();
   signal_.wait(lk, [&] {
-    return exit_ ||
-           (imm_ == nullptr && !CompactionNeeded() && !VlogGcNeeded());
+    return exit_ || (imm_ == nullptr && !CompactionNeeded() &&
+                     !VlogGcNeeded() && !vlog_gc_active_);
   });
 }
 
