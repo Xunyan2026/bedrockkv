@@ -34,13 +34,14 @@ jobs:
       - name: Expose failure output
         if: failure()
         run: |
+          # Passing tests' stdout is hidden by ctest; run the diagnostic
+          # binary directly so its probe output reaches the annotations.
+          ./build/ring_test --gtest_filter='*DIAGNOSTIC*' > /tmp/diag_out.txt 2>&1 || true
           python3 - <<'PYEOF'
-          text = open('/tmp/test_out.txt', errors='replace').read()
+          text = open('/tmp/diag_out.txt', errors='replace').read()
+          text += '\n=== ctest tail ===\n'
+          text += open('/tmp/test_out.txt', errors='replace').read()[-20000:]
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          tail = text[-24000:]
-          for i in range(0, len(tail), 3000):
-              print(f"::error::CI-TEST tail[{i//3000}]: {tail[i:i+3000]}")
-          if len(text) > 24000:
-              head = text[:3000]
-              print(f"::error::CI-TEST head: {head}")
+          for i in range(0, len(text), 3000):
+              print(f"::error::CI-TEST[{i//3000}]: {text[i:i+3000]}")
           PYEOF
