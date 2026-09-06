@@ -1,6 +1,7 @@
 // Unit tests for the stage-1 DB: basic ops, reopen persistence, torn-tail
 // recovery, and the fork + kill -9 crash test with prefix-integrity
 // verification (design doc ch.7).
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -544,6 +545,299 @@ TEST(DBTest, LeveledLookupAfterCompactionFindsSmallKeys) {
     ASSERT_TRUE(db->Get("key" + std::to_string(i), &v).ok())
         << "lost key" << i << " after compaction";
     EXPECT_EQ(v, std::string(80, 'v'));
+  }
+}
+
+// ---- stage 3 batch 2: WiscKey value separation + vLog GC ----
+
+// Counts files ending in `suffix` in `dir` (tests inspect the engine's
+// file layout directly — the GC's observable promise is "old generations
+// disappear").
+int CountFilesWithSuffix(const std::string& dir, const std::string& suffix) {
+  int n = 0;
+  DIR* d = ::opendir(dir.c_str());
+  if (d == nullptr) {
+    return -1;
+  }
+  while (const dirent* e = ::readdir(d)) {
+    const std::string name = e->d_name;
+    if (name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) ==
+            0) {
+      ++n;
+    }
+  }
+  ::closedir(d);
+  return n;
+}
+
+Options SeparationOptions(size_t vlog_gc_size) {
+  Options opts;
+  opts.sync_mode = SyncMode::kSyncNever;
+  opts.enable_value_separation = true;
+  opts.value_separation_threshold = 1024;
+  opts.vlog_gc_size = vlog_gc_size;
+  return opts;
+}
+
+TEST(DBTest, ValueSeparationRoundTripAndReopen) {
+  const std::string dir = FreshDBDir("db_vsep_roundtrip");
+  auto db = DB::Open(dir, SeparationOptions(64u << 20));
+  ASSERT_NE(db, nullptr);
+
+  // Both sides of the threshold: values below it stay inline, values at
+  // or above it go to the vLog. Everything must read back identically.
+  const std::string small = "tiny";
+  const std::string big = std::string(4096, 'B');
+  const std::string exact = std::string(1024, 'E');  // exactly at threshold
+  ASSERT_TRUE(db->Put("small", small).ok());
+  ASSERT_TRUE(db->Put("big", big).ok());
+  ASSERT_TRUE(db->Put("exact", exact).ok());
+  db->wait_for_background_work();
+
+  std::string v;
+  ASSERT_TRUE(db->Get("small", &v).ok());
+  EXPECT_EQ(v, small);
+  ASSERT_TRUE(db->Get("big", &v).ok());
+  EXPECT_EQ(v, big);
+  ASSERT_TRUE(db->Get("exact", &v).ok());
+  EXPECT_EQ(v, exact);
+  ASSERT_GE(CountFilesWithSuffix(dir, ".vlog"), 1)
+      << "no vLog file: big values were not separated";
+
+  // Reopen: pointers in the SSTs must resolve through the re-opened
+  // vLog generation.
+  db.reset();
+  db = DB::Open(dir, SeparationOptions(64u << 20));
+  ASSERT_NE(db, nullptr);
+  ASSERT_TRUE(db->Get("small", &v).ok());
+  EXPECT_EQ(v, small);
+  ASSERT_TRUE(db->Get("big", &v).ok());
+  EXPECT_EQ(v, big);
+  ASSERT_TRUE(db->Get("exact", &v).ok());
+  EXPECT_EQ(v, exact);
+}
+
+TEST(DBTest, ValueSeparationOverwritesDeletesAndScan) {
+  const std::string dir = FreshDBDir("db_vsep_mix");
+  auto db = DB::Open(dir, SeparationOptions(64u << 20));
+  ASSERT_NE(db, nullptr);
+
+  const std::string v1 = std::string(2048, '1');
+  const std::string v2 = std::string(2048, '2');
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), v1).ok());
+  }
+  // Overwrite half (new vLog entries, old ones become garbage), delete
+  // a few, keep the rest.
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), v2).ok());
+  }
+  for (int i = 15; i < 20; ++i) {
+    ASSERT_TRUE(db->Delete("k" + std::to_string(i)).ok());
+  }
+  db->wait_for_background_work();
+
+  std::string v;
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(db->Get("k" + std::to_string(i), &v).ok());
+    EXPECT_EQ(v, v2);
+  }
+  for (int i = 10; i < 15; ++i) {
+    ASSERT_TRUE(db->Get("k" + std::to_string(i), &v).ok());
+    EXPECT_EQ(v, v1);
+  }
+  for (int i = 15; i < 20; ++i) {
+    EXPECT_TRUE(IsNotFound(db->Get("k" + std::to_string(i), &v)));
+  }
+
+  // Scan resolves pointers too: 15 live keys, newest values.
+  std::map<std::string, std::string> scanned;
+  ASSERT_TRUE(
+      db->Scan("k0", "k99",
+               [&scanned](std::string_view k, std::string_view val) {
+                 scanned.emplace(std::string(k), std::string(val));
+               })
+          .ok());
+  ASSERT_EQ(scanned.size(), 15u);
+  EXPECT_EQ(scanned.at("k0"), v2);
+  EXPECT_EQ(scanned.at("k12"), v1);
+}
+
+TEST(DBTest, SeparationSurvivesFlushAndCompaction) {
+  // Tiny thresholds force memtable flushes and L0->L1 compaction while
+  // separated pointers flow through them. Compaction treats pointers as
+  // opaque values — that is the whole WiscKey design — so every value
+  // must still resolve afterwards.
+  const std::string dir = FreshDBDir("db_vsep_compact");
+  Options opts = SeparationOptions(64u << 20);
+  opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 64 * 1024;
+  opts.max_sst_size = 16 * 1024;
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const std::string value = std::string(1500, static_cast<char>('a' + i % 26));
+    ASSERT_TRUE(db->Put("key" + std::to_string(i), value).ok());
+  }
+  db->wait_for_background_work();
+  ASSERT_GE(db->level_file_count(1), 1u) << "no compaction happened";
+
+  std::string v;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &v).ok())
+        << "lost key" << i << " after flush+compaction";
+    EXPECT_EQ(v, std::string(1500, static_cast<char>('a' + i % 26)));
+  }
+
+  // And after reopen, where pointers come back from the SSTs.
+  db.reset();
+  db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  ASSERT_TRUE(db->Get("key7", &v).ok());
+  EXPECT_EQ(v, std::string(1500, 'h'));
+}
+
+// GC contract: garbage (overwritten/deleted values) is reclaimed, live
+// values survive untouched, and the old generation's file disappears.
+TEST(DBTest, VlogGcReclaimsGarbageKeepsLive) {
+  const std::string dir = FreshDBDir("db_vsep_gc");
+  // 64 KiB trigger: the 2x-live rule means GC fires once the file holds
+  // more garbage than live bytes.
+  auto db = DB::Open(dir, SeparationOptions(64u << 10));
+  ASSERT_NE(db, nullptr);
+
+  const std::string first = std::string(2048, 'a');
+  const std::string second = std::string(2048, 'b');
+  // 300 live keys; then overwrite ALL of them (every first version turns
+  // to garbage) and delete 100 (their second version turns to garbage,
+  // too).
+  for (int i = 0; i < 300; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), first).ok());
+  }
+  for (int i = 0; i < 300; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), second).ok());
+  }
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db->Delete("k" + std::to_string(i)).ok());
+  }
+  db->wait_for_background_work();
+
+  EXPECT_GE(db->vlog_gc_count(), 1u) << "GC never ran";
+  EXPECT_EQ(CountFilesWithSuffix(dir, ".vlog"), 1)
+      << "old vLog generation still on disk after GC";
+
+  std::string v;
+  for (int i = 100; i < 300; ++i) {
+    ASSERT_TRUE(db->Get("k" + std::to_string(i), &v).ok())
+        << "GC lost live key" << i;
+    EXPECT_EQ(v, second);
+  }
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(IsNotFound(db->Get("k" + std::to_string(i), &v)));
+  }
+
+  // Survives reopen with the reclaimed layout.
+  db.reset();
+  db = DB::Open(dir, SeparationOptions(64u << 10));
+  ASSERT_NE(db, nullptr);
+  ASSERT_TRUE(db->Get("k250", &v).ok());
+  EXPECT_EQ(v, second);
+}
+
+// The full model test, separation on: random puts/gets/deletes against
+// std::map with flushes, compaction and GC all firing underneath.
+TEST(DBTest, SeparationModelTestAgainstStdMap) {
+  const std::string dir = FreshDBDir("db_vsep_model");
+  Options opts = SeparationOptions(32u << 10);
+  opts.write_buffer_size = 16 * 1024;
+  opts.l0_compaction_trigger = 2;
+  opts.level_base_size = 64 * 1024;
+  opts.max_sst_size = 16 * 1024;
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  std::map<std::string, std::string> model;
+  TestRng rng(20260909);
+  const int kN = 600;
+  for (int i = 0; i < kN; ++i) {
+    const std::string key = "key" + std::to_string(rng.Uniform(150));
+    // Values straddle the separation threshold (64..300 bytes).
+    const std::string value(rng.Uniform(237) + 64,
+                            static_cast<char>(rng.Uniform(256)));
+    if (rng.Percent(55)) {
+      ASSERT_TRUE(db->Put(key, value).ok());
+      model[key] = value;
+    } else if (rng.Percent(45)) {  // 20% of all iterations
+      ASSERT_TRUE(db->Delete(key).ok());
+      model.erase(key);
+    } else {
+      std::string v;
+      const Status s = db->Get(key, &v);
+      const auto it = model.find(key);
+      if (it == model.end()) {
+        EXPECT_TRUE(IsNotFound(s)) << "ghost value for " << key;
+      } else {
+        ASSERT_TRUE(s.ok()) << "missing live key " << key;
+        EXPECT_EQ(v, it->second);
+      }
+    }
+    if (i % 50 == 0) {
+      db->wait_for_background_work();
+    }
+  }
+  db->wait_for_background_work();
+
+  // Full verification pass.
+  std::string v;
+  for (const auto& [key, expected] : model) {
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key;
+    EXPECT_EQ(v, expected);
+  }
+  db.reset();
+  db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+  for (const auto& [key, expected] : model) {
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key << " after reopen";
+    EXPECT_EQ(v, expected);
+  }
+}
+
+// Regression: the lost-wakeup deadlock. Separated values leave ~40-byte
+// memtable entries, so with a large write buffer NO rotation ever fires
+// — and rotations were the only thing waking the background thread. The
+// vLog crossed its GC trigger with the background thread asleep, and
+// wait_for_background_work() (whose predicate requires !VlogGcNeeded)
+// blocked forever on a GC nobody would ever start. The fix: a write that
+// crosses the trigger wakes the background thread, and
+// wait_for_background_work() notifies before waiting.
+TEST(DBTest, VlogGcRunsAfterTriggerWithoutAnyRotation) {
+  const std::string dir = FreshDBDir("db_vsep_wakeup");
+  Options opts = SeparationOptions(256 * 1024);  // GC trigger: 256 KiB
+  opts.value_separation_threshold = 64;  // 512 B values must separate
+  opts.write_buffer_size = 32u << 20;            // no rotation, ever
+  auto db = DB::Open(dir, opts);
+  ASSERT_NE(db, nullptr);
+
+  // 5000 x 512 B = ~2.6 MB of vLog bytes: 10x over the trigger, all
+  // without a single memtable rotation.
+  for (int i = 0; i < 5000; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    const std::string value(512, static_cast<char>(i & 0xff));
+    ASSERT_TRUE(db->Put(key, value).ok());
+  }
+  // Before the fix this never returned; after it, the GC must have run.
+  db->wait_for_background_work();
+  EXPECT_GE(db->vlog_gc_count(), 1);
+  EXPECT_EQ(CountFilesWithSuffix(dir, ".vlog"), 1);  // old generation gone
+
+  std::string v;
+  for (int i = 0; i < 5000; i += 97) {
+    const std::string key = "k" + std::to_string(i);
+    ASSERT_TRUE(db->Get(key, &v).ok()) << "lost " << key;
+    EXPECT_EQ(v, std::string(512, static_cast<char>(i & 0xff)));
   }
 }
 

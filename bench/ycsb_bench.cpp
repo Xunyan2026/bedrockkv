@@ -43,6 +43,8 @@ struct Config {
   uint64_t seed = 42;
   std::string dir = "/tmp/bedrockkv_ycsb";
   bool reuse_dir = false;
+  bool vsep = false;
+  size_t gc_size = 64u << 20;
   SyncMode sync_mode = SyncMode::kSyncPeriodic;
 };
 
@@ -57,6 +59,8 @@ void PrintUsage() {
       "  --seed N            deterministic RNG seed (default 42)\n"
       "  --dir PATH          database directory\n"
       "  --sync always|periodic|never  WAL durability mode (default periodic)\n"
+      "  --vsep              enable WiscKey value separation (+ vLog GC)\n"
+      "  --gc_size N         vLog GC trigger in bytes (default 67108864)\n"
       "  --reuse_dir         keep the previous directory instead of wiping\n");
 }
 
@@ -75,6 +79,8 @@ Config ParseArgs(int argc, char** argv) {
     else if (a == "--seed") c.seed = std::strtoull(next(), nullptr, 10);
     else if (a == "--dir") c.dir = next();
     else if (a == "--reuse_dir") c.reuse_dir = true;
+    else if (a == "--vsep") c.vsep = true;
+    else if (a == "--gc_size") c.gc_size = std::strtoull(next(), nullptr, 10);
     else if (a == "--sync") {
       const std::string m = next();
       if (m == "always") c.sync_mode = SyncMode::kSyncAlways;
@@ -107,6 +113,18 @@ std::string FormatNs(int64_t ns) {
     std::snprintf(buf, sizeof(buf), "%lldns", static_cast<long long>(ns));
   }
   return buf;
+}
+
+Options BenchOptions(const Config& c) {
+  Options o;
+  o.sync_mode = c.sync_mode;
+  o.write_buffer_size = 4u << 20;
+  o.l0_compaction_trigger = 4;
+  o.level_base_size = 10u << 20;
+  o.max_sst_size = 4u << 20;
+  o.enable_value_separation = c.vsep;
+  o.vlog_gc_size = c.gc_size;
+  return o;
 }
 
 int64_t NowNs() {
@@ -255,7 +273,9 @@ void RunWorkload(const Config& c, const WorkloadSpec& w, DB* db) {
   const int64_t bg_elapsed = NowNs() - t0;
 
   const double secs = static_cast<double>(elapsed) / 1e9;
-  const uint64_t disk_bytes = db->wal_bytes_written() + db->sst_bytes_written();
+  const uint64_t disk_bytes = db->wal_bytes_written() +
+                              db->sst_bytes_written() +
+                              db->vlog_bytes_written();
   const uint64_t user_bytes = db->user_bytes_written();
   std::printf("RUN  [%s] %s\n", w.name, w.description);
   std::printf("     throughput: %.0f ops/s (%llu ops in %.2fs)\n",
@@ -277,16 +297,18 @@ void RunWorkload(const Config& c, const WorkloadSpec& w, DB* db) {
                      std::to_string(total_scanned))
                         .c_str()
                   : "");
-  std::printf("     write amp : %.2fx  (wal=%.1fMB sst=%.1fMB user=%.1fMB, "
-              "%llu flushes, %llu compactions)\n",
+  std::printf("     write amp : %.2fx  (wal=%.1fMB sst=%.1fMB vlog=%.1fMB "
+              "user=%.1fMB, %llu flushes, %llu compactions, %llu vlog GCs)\n",
               disk_bytes > 0 ? static_cast<double>(disk_bytes) /
                                    static_cast<double>(user_bytes)
                              : 0.0,
               static_cast<double>(db->wal_bytes_written()) / 1e6,
               static_cast<double>(db->sst_bytes_written()) / 1e6,
+              static_cast<double>(db->vlog_bytes_written()) / 1e6,
               static_cast<double>(user_bytes) / 1e6,
               (unsigned long long)db->flush_count(),
-              (unsigned long long)db->compaction_count());
+              (unsigned long long)db->compaction_count(),
+              (unsigned long long)db->vlog_gc_count());
   std::printf("     (incl. bg drain: %.2fs total)\n\n",
               static_cast<double>(bg_elapsed) / 1e9);
 }
@@ -302,10 +324,7 @@ int main(int argc, char** argv) {
       one.workload_name = w.name;
       RemoveDirTree(one.dir);
       Status s;
-      auto db = DB::Open(one.dir,
-                         Options{one.sync_mode, 4u << 20, 4, 10u << 20,
-                                 4u << 20},
-                         &s);
+      auto db = DB::Open(one.dir, BenchOptions(one), &s);
       if (db == nullptr) {
         std::printf("Open failed: %s\n", s.message().c_str());
         return 1;
@@ -326,9 +345,7 @@ int main(int argc, char** argv) {
     RemoveDirTree(c.dir);
   }
   Status s;
-  auto db = DB::Open(c.dir, Options{c.sync_mode, 4u << 20, 4, 10u << 20,
-                                    4u << 20},
-                     &s);
+  auto db = DB::Open(c.dir, BenchOptions(c), &s);
   if (db == nullptr) {
     std::printf("Open failed: %s\n", s.message().c_str());
     return 1;

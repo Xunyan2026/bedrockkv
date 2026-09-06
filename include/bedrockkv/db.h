@@ -44,14 +44,30 @@
 // can leave a memtable pending flush, with its records in a retired log
 // the MANIFEST does not yet name — that log must survive and be
 // replayed). A generation is deleted only once the floor moves past it.
+//
+// WiscKey value separation (stage 3): with
+// Options::enable_value_separation, values >= value_separation_threshold
+// bypass the LSM entirely — they are appended to a value log (VLog) and
+// the LSM carries a 21-byte pointer in the value slot. Pointers are
+// opaque below the DB layer: WAL records, memtables, SSTs and
+// compaction move them like any other value and never rewrite them, so
+// compaction traffic shrinks from "every byte ever written, several
+// times" to "one pointer per key". The DB layer resolves pointers on
+// Get/Scan through a sharded LRU read cache, and a threshold-triggered
+// background GC rewrites live entries into a fresh vLog generation
+// (docs/vlog-format.md for the format and crash story). The MANIFEST
+// additionally names every live vLog generation, because until GC
+// finishes, pointers may reference the old one.
 #pragma once
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -59,9 +75,11 @@
 
 #include "bedrockkv/iterator.h"
 #include "bedrockkv/log.h"
+#include "bedrockkv/lru_cache.h"
 #include "bedrockkv/memtable.h"
 #include "bedrockkv/status.h"
 #include "bedrockkv/sstable.h"
+#include "bedrockkv/vlog.h"
 
 namespace bedrockkv {
 
@@ -83,6 +101,16 @@ struct Options {
   size_t l0_compaction_trigger = 4;    // L0 files before L0 -> L1
   size_t level_base_size = 10u << 20;  // L1 target; Ln = base * 10^(n-1)
   size_t max_sst_size = 4u << 20;      // compaction output file split size
+  // WiscKey value separation (stage 3). When enabled, values at least
+  // value_separation_threshold bytes go to the vLog; smaller values stay
+  // inline in the LSM (the pointer is 21 bytes — separating tiny values
+  // would cost more than it saves). vlog_gc_size triggers a full-rewrite
+  // GC when the current vLog generation crosses it. Note: once a database
+  // has separated values, keep the switch on — pointers left in the LSM
+  // cannot be resolved with separation disabled.
+  bool enable_value_separation = false;
+  size_t value_separation_threshold = 1024;
+  size_t vlog_gc_size = 64u << 20;
 };
 
 // L0..L6. levels_[i] below holds L(i+1); L0 is separate because its
@@ -111,6 +139,7 @@ class DB {
 
   static std::string SstFileName(uint64_t number);  // e.g. 000003.sst
   static std::string LogFileName(uint64_t number);  // e.g. 000003.log
+  static std::string VlogFileName(uint64_t number);  // e.g. 000003.vlog
 
   // Opens (creating if necessary) a database rooted at `dir`. Returns
   // nullptr on failure with *status (if provided) describing the error.
@@ -154,15 +183,17 @@ class DB {
   // (WAL vs SST) makes flush/compaction contributions visible separately.
   uint64_t wal_bytes_written() const { return stats_wal_bytes_.load(std::memory_order_relaxed); }
   uint64_t sst_bytes_written() const { return stats_sst_bytes_.load(std::memory_order_relaxed); }
+  uint64_t vlog_bytes_written() const { return stats_vlog_bytes_.load(std::memory_order_relaxed); }
   uint64_t user_bytes_written() const { return stats_user_bytes_.load(std::memory_order_relaxed); }
   uint64_t flush_count() const { return stats_flushes_.load(std::memory_order_relaxed); }
   uint64_t compaction_count() const { return stats_compactions_.load(std::memory_order_relaxed); }
+  uint64_t vlog_gc_count() const { return stats_vlog_gcs_.load(std::memory_order_relaxed); }
 
  private:
-  DB() = default;
+  DB();
 
-  Status WriteEntry(uint8_t type, std::string_view key,
-                    std::string_view value);  // mutex held
+  Status WriteEntry(uint8_t type, std::string_view key, std::string_view value,
+                    bool count_user_bytes = true);  // mutex held
   Status MaybeSync();                         // mutex held
   Status RotateForFlush();                    // mutex held
   void BackgroundLoop();
@@ -180,10 +211,31 @@ class DB {
                        size_t output_level_index);
   Status WriteManifest();  // mutex held
   void RemoveOrphanFiles(const std::vector<sst::FileMeta>& files,
-                         uint64_t log_floor) const;
+                         uint64_t log_floor,
+                         const std::set<uint64_t>& live_vlogs) const;
+
+  // ---- value separation internals ----
+  // The read-path traversal shared by Get and by the GC's liveness check.
+  // No locking: callers either hold the mutex (GC) or pass snapshot
+  // copies they took under it (Get). `stored` receives the raw slot
+  // contents: an inline value, a 21-byte value pointer, or empty.
+  MemTable::Lookup LookupIn(const std::shared_ptr<MemTable>& mem,
+                            const std::shared_ptr<MemTable>& imm,
+                            const std::shared_ptr<Version>& v,
+                            std::string_view key, std::string* stored,
+                            Status* error) const;
+  // Replaces a 21-byte value pointer in *value with the bytes it selects
+  // (via the LRU cache + vLog pread). Inline values pass through.
+  Status MaybeResolvePointer(std::string* value) const;
+  // Copies the shared_ptr for `number` out of vlogs_ under the mutex so
+  // the caller can pread lock-free; nullptr if the generation is gone.
+  std::shared_ptr<VLog> VLogFor(uint64_t number) const;
+  bool VlogGcNeeded() const;  // mutex held
+  Status RunVlogGC();         // background thread, called without the lock
 
   std::string SstPath(uint64_t number) const { return dir_ + "/" + SstFileName(number); }
   std::string LogPath(uint64_t number) const { return dir_ + "/" + LogFileName(number); }
+  std::string VlogPath(uint64_t number) const { return dir_ + "/" + VlogFileName(number); }
   std::string ManifestPath() const { return dir_ + "/" + kManifestFileName; }
 
   std::string dir_;
@@ -204,13 +256,32 @@ class DB {
   uint64_t next_file_number_ = 1;
   uint64_t log_number_ = 0;
 
+  // WiscKey value-separation state (mutex_-guarded unless noted).
+  bool vsep_enabled_ = false;
+  size_t vsep_threshold_ = 0;   // clamped to >= 64 at Open (pointer collision)
+  size_t vlog_gc_size_ = 0;
+  std::map<uint64_t, std::shared_ptr<VLog>> vlogs_;  // every live generation
+  std::shared_ptr<VLog> vlog_current_;               // append target, in vlogs_
+  // GC-trigger floor, measured by the previous pass: twice the bytes it
+  // had to rewrite (i.e. the live data volume it saw). The first GC
+  // triggers on file size alone; afterwards the floor keeps GC from
+  // rewriting mostly-live files forever (see VlogGcNeeded).
+  uint64_t vlog_gc_floor_ = 0;
+  // Read cache for separated values: key = encoded 21-byte pointer,
+  // weight = value bytes. Sharded + internally locked, so Get/Scan may
+  // touch it after releasing mutex_ — hence mutable under const methods.
+  mutable ShardedLruCache<std::string, std::string, std::hash<std::string>>
+      vlog_cache_;
+
   // Diagnostics counters (see the accessors above). Relaxed is enough:
   // they are observability, never read back to make decisions.
   std::atomic<uint64_t> stats_wal_bytes_{0};
   std::atomic<uint64_t> stats_sst_bytes_{0};
+  std::atomic<uint64_t> stats_vlog_bytes_{0};
   std::atomic<uint64_t> stats_user_bytes_{0};
   std::atomic<uint64_t> stats_flushes_{0};
   std::atomic<uint64_t> stats_compactions_{0};
+  std::atomic<uint64_t> stats_vlog_gcs_{0};
 
   // Background machinery.
   mutable std::mutex mutex_;

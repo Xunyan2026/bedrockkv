@@ -31,13 +31,15 @@ constexpr size_t kL0Source = std::numeric_limits<size_t>::max();
 // MANIFEST record tags (each is the payload of one log::Writer record).
 constexpr uint8_t kManifestTagSstFile = 1;
 constexpr uint8_t kManifestTagLogNumber = 2;
+constexpr uint8_t kManifestTagVlogFile = 3;
 
-// The MANIFEST is a full snapshot of the SST list (with levels) plus the
-// current log generation, rewritten atomically on every change. Using
-// our own log format is deliberate: records are CRC-protected and the
-// reader machinery already exists.
+// The MANIFEST is a full snapshot of the SST list (with levels), the
+// live vLog generations, and the current log generation, rewritten
+// atomically on every change. Using our own log format is deliberate:
+// records are CRC-protected and the reader machinery already exists.
 struct ManifestState {
   std::vector<sst::FileMeta> files;
+  std::vector<uint64_t> vlogs;  // live vLog generations, ascending
   uint64_t log_number = 0;
   bool has_log_number = false;
 };
@@ -79,6 +81,7 @@ bool ParseManifest(const std::string& path, ManifestState* state) {
   log::Reader reader(fd);
   std::string record;
   uint64_t last_file_number = 0;
+  uint64_t last_vlog_number = 0;
   bool ok = true;
   for (;;) {
     uint64_t unused = 0;
@@ -107,6 +110,21 @@ bool ParseManifest(const std::string& path, ManifestState* state) {
       }
       state->log_number = GetFixed64(record.data() + 1);
       state->has_log_number = true;
+    } else if (tag == kManifestTagVlogFile) {
+      // One record per live vLog generation, ascending. Multiple
+      // generations are live while a GC rewrite is in progress (or was
+      // interrupted) — pointers in the LSM may still select the old one.
+      if (record.size() != 9) {
+        ok = false;
+        break;
+      }
+      const uint64_t n = GetFixed64(record.data() + 1);
+      if (n <= last_vlog_number) {
+        ok = false;
+        break;
+      }
+      last_vlog_number = n;
+      state->vlogs.push_back(n);
     } else {
       ok = false;
       break;
@@ -191,8 +209,17 @@ std::string DB::LogFileName(uint64_t number) {
   return buf;
 }
 
+std::string DB::VlogFileName(uint64_t number) {
+  return VLog::FileName(number);
+}
+
+DB::DB()
+    : vlog_cache_(16, 32u << 20,
+                  [](const std::string& v) { return v.size(); }) {}
+
 void DB::RemoveOrphanFiles(const std::vector<sst::FileMeta>& live,
-                           uint64_t log_floor) const {
+                           uint64_t log_floor,
+                           const std::set<uint64_t>& live_vlogs) const {
   std::set<uint64_t> live_sst;
   for (const sst::FileMeta& m : live) {
     live_sst.insert(m.file_number);
@@ -218,6 +245,13 @@ void DB::RemoveOrphanFiles(const std::vector<sst::FileMeta>& live,
       // it either reached an SST or is worthless. At-or-above-floor logs
       // are KEPT — a memtable may still be pending flush with its only
       // records inside.
+      ::unlink((dir_ + "/" + name).c_str());
+    } else if (ParseNumberedFile(name, ".vlog", &number) &&
+               !live_vlogs.count(number)) {
+      // A vLog generation the MANIFEST does not name: either it was
+      // never published (crash right after GC rotation) or GC finished
+      // and dropped it before the unlink. Unnamed vLogs are unreachable
+      // by construction — the MANIFEST is the only authority.
       ::unlink((dir_ + "/" + name).c_str());
     }
   }
@@ -293,6 +327,37 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   }
   db->current_ = std::move(version);
 
+  // ---- 2b. open the value logs (WiscKey) ----
+  // The MANIFEST names every live vLog generation: while a GC rewrite is
+  // in flight (or was interrupted by a crash) pointers in the LSM may
+  // still select the OLD generation, so it stays published until every
+  // entry has been rewritten. The newest generation is the append
+  // target. A database with no named vLogs either is fresh or predates
+  // value separation — generation 1 starts the separated era.
+  std::set<uint64_t> live_vlogs(ms.vlogs.begin(), ms.vlogs.end());
+  if (options.enable_value_separation) {
+    if (live_vlogs.empty()) {
+      live_vlogs.insert(1);
+    }
+    for (const uint64_t number : live_vlogs) {
+      Status s = Status::Ok();
+      auto vl = VLog::Open(dir, number, &s);
+      if (vl == nullptr) {
+        return fail("cannot open vlog " + VLog::FileName(number) + ": " +
+                    s.message());
+      }
+      max_seen_number = std::max(max_seen_number, number);
+      db->vlogs_.emplace(number, std::move(vl));
+    }
+    db->vlog_current_ = db->vlogs_.rbegin()->second;
+    db->vsep_enabled_ = true;
+    db->vlog_gc_size_ = std::max<size_t>(options.vlog_gc_size, 64u << 10);
+    // A 21-byte inline value starting with 0xFF would be misread as a
+    // pointer, so the threshold can never be clamped into that range.
+    db->vsep_threshold_ =
+        std::max<size_t>(options.value_separation_threshold, 64);
+  }
+
   // ---- 3. enumerate the logs to replay ----
   // The MANIFEST's log number is a REPLAY FLOOR, not "the one log": a
   // shutdown/crash can leave a memtable pending flush in the background,
@@ -322,7 +387,7 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   db->log_number_ = log_numbers.back();  // new writes append to the newest
 
   // ---- 4. remove leftovers from crashed flushes/compactions ----
-  db->RemoveOrphanFiles(ms.files, replay_floor);
+  db->RemoveOrphanFiles(ms.files, replay_floor, live_vlogs);
   db->next_file_number_ =
       std::max(max_seen_number, log_numbers.back()) + 1;
 
@@ -483,6 +548,20 @@ Status DB::WriteManifest() {
       }
     }
     if (result.ok()) {
+      // Every live vLog generation, ascending (std::map iterates sorted).
+      // No records when separation is off — the parser accepts both.
+      for (const auto& [number, vl] : vlogs_) {
+        (void)vl;
+        std::string p;
+        p.push_back(static_cast<char>(kManifestTagVlogFile));
+        PutFixed64(&p, number);
+        result = writer.AddRecord(p);
+        if (!result.ok()) {
+          break;
+        }
+      }
+    }
+    if (result.ok()) {
       std::string p;
       p.push_back(static_cast<char>(kManifestTagLogNumber));
       PutFixed64(&p, log_number_);
@@ -510,18 +589,50 @@ Status DB::WriteManifest() {
 // ---- write path ----
 
 Status DB::WriteEntry(uint8_t type, std::string_view key,
-                      std::string_view value) {
+                      std::string_view value, bool count_user_bytes) {
   // Mutex held. WAL first, MemTable second: if we crash in between, the
   // record is simply replayed on recovery. The reverse order could lose
   // an acknowledged write — the cardinal sin of a persistent store.
+  //
+  // With value separation the "value" that flows onward is a 21-byte
+  // pointer: the real bytes go to the vLog FIRST (append order = fsync
+  // order below), so a durable WAL record can never reference vLog bytes
+  // that were not durable first. Orphaned vLog bytes (key never reached
+  // the WAL) are harmless — GC reclaims them.
+  std::string_view stored = value;
+  std::string pointer;
+  if (type == kTypeValue && vsep_enabled_ && value.size() >= vsep_threshold_) {
+    uint64_t offset = 0;
+    uint64_t entry_bytes = 0;
+    const Status s = vlog_current_->Append(key, value, &offset, &entry_bytes);
+    if (!s.ok()) {
+      return s;
+    }
+    pointer = EncodeValuePointer(
+        ValuePointer{vlog_current_->file_number(), offset,
+                     static_cast<uint32_t>(value.size())});
+    stored = pointer;
+    // The vLog shares the WAL's sync budget: one threshold drives both
+    // fsyncs, and the WAL's schedule covers the vLog's.
+    unsynced_bytes_ += entry_bytes;
+    stats_vlog_bytes_ += entry_bytes;
+    // Value separation shrinks memtable entries to ~40 bytes, so user
+    // rotations (the usual wakeup source) become rare and the vLog can
+    // cross its GC trigger with the background thread still asleep.
+    // Notify as soon as the trigger is crossed — not only on rotation.
+    if (vlog_current_->file_size() >=
+        (vlog_gc_size_ > vlog_gc_floor_ ? vlog_gc_size_ : vlog_gc_floor_)) {
+      signal_.notify_one();
+    }
+  }
   std::string payload;
   PutFixed64(&payload, next_seq_);
   payload.push_back(static_cast<char>(type));
   PutFixed32(&payload, static_cast<uint32_t>(key.size()));
   payload.append(key);
   if (type == kTypeValue) {
-    PutFixed32(&payload, static_cast<uint32_t>(value.size()));
-    payload.append(value);
+    PutFixed32(&payload, static_cast<uint32_t>(stored.size()));
+    payload.append(stored);
   }
   Status s = log_writer_->AddRecord(payload);
   if (!s.ok()) {
@@ -529,13 +640,15 @@ Status DB::WriteEntry(uint8_t type, std::string_view key,
   }
   unsynced_bytes_ += payload.size() + log::kHeaderSize;
   stats_wal_bytes_ += payload.size() + log::kHeaderSize;
-  stats_user_bytes_ += key.size() + value.size();
+  if (count_user_bytes) {
+    stats_user_bytes_ += key.size() + value.size();
+  }
   s = MaybeSync();
   if (!s.ok()) {
     return s;
   }
   if (type == kTypeValue) {
-    mem_->Put(next_seq_, key, value);
+    mem_->Put(next_seq_, key, stored);
   } else {
     mem_->Delete(next_seq_, key);
   }
@@ -555,9 +668,19 @@ Status DB::MaybeSync() {
     case SyncMode::kSyncNever:
       return Status::Ok();
   }
-  if (need && ::fsync(log_fd_) != 0) {
-    return Status::IOError(std::string("log fsync failed: ") +
-                           std::strerror(errno));
+  if (need) {
+    // vLog BEFORE WAL (see WriteEntry): the WAL record's durability must
+    // imply the durability of the vLog bytes it points at.
+    if (vlog_current_ != nullptr) {
+      const Status s = vlog_current_->Sync();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    if (::fsync(log_fd_) != 0) {
+      return Status::IOError(std::string("log fsync failed: ") +
+                             std::strerror(errno));
+    }
   }
   unsynced_bytes_ = 0;
   return Status::Ok();
@@ -631,33 +754,33 @@ Status DB::Delete(std::string_view key) {
 
 // ---- read path ----
 
-Status DB::Get(std::string_view key, std::string* value) const {
-  // Snapshot under the mutex, then read lock-free: the shared_ptrs keep
-  // the memtables and every table of the version alive even if a
-  // concurrent flush/compaction publishes a new Version right away.
-  std::shared_ptr<MemTable> mem, imm;
-  std::shared_ptr<Version> v;
-  {
-    std::lock_guard<std::mutex> lk(mutex_);
-    mem = mem_;
-    imm = imm_;
-    v = current_;
-  }
+// ---- read path ----
 
-  switch (mem->Get(key, value)) {
+// The shared read traversal. No locking: `Get` passes snapshot copies,
+// the GC passes the live members while holding the mutex. `stored`
+// receives the raw value-slot contents — an inline value, or (with
+// separation) a 21-byte value pointer that only the DB layer resolves.
+// A real I/O error from a table lookup is returned via *error (may be
+// nullptr when the caller treats any miss the same); a plain miss is not.
+MemTable::Lookup DB::LookupIn(const std::shared_ptr<MemTable>& mem,
+                              const std::shared_ptr<MemTable>& imm,
+                              const std::shared_ptr<Version>& v,
+                              std::string_view key, std::string* stored,
+                              Status* error) const {
+  switch (mem->Get(key, stored)) {
     case MemTable::Lookup::kFound:
-      return Status::Ok();
+      return MemTable::Lookup::kFound;
     case MemTable::Lookup::kDeleted:
-      return Status::NotFound("deleted: " + std::string(key));
+      return MemTable::Lookup::kDeleted;
     case MemTable::Lookup::kMissing:
       break;
   }
   if (imm != nullptr) {
-    switch (imm->Get(key, value)) {
+    switch (imm->Get(key, stored)) {
       case MemTable::Lookup::kFound:
-        return Status::Ok();
+        return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
-        return Status::NotFound("deleted: " + std::string(key));
+        return MemTable::Lookup::kDeleted;
       case MemTable::Lookup::kMissing:
         break;
     }
@@ -669,14 +792,17 @@ Status DB::Get(std::string_view key, std::string* value) const {
   // an older file's value must not resurrect through it.
   for (const TableRef& r : v->l0) {
     Status s = Status::Ok();
-    switch (r.table->Get(key, value, &s)) {
+    switch (r.table->Get(key, stored, &s)) {
       case MemTable::Lookup::kFound:
-        return Status::Ok();
+        return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
-        return Status::NotFound("deleted: " + std::string(key));
+        return MemTable::Lookup::kDeleted;
       case MemTable::Lookup::kMissing:
         if (!s.ok()) {
-          return s;  // real corruption, not an absent key
+          if (error != nullptr) {
+            *error = s;
+          }
+          return MemTable::Lookup::kMissing;
         }
         continue;
     }
@@ -698,17 +824,52 @@ Status DB::Get(std::string_view key, std::string* value) const {
       continue;  // falls into the gap after that file
     }
     Status s = Status::Ok();
-    switch (it->table->Get(key, value, &s)) {
+    switch (it->table->Get(key, stored, &s)) {
       case MemTable::Lookup::kFound:
-        return Status::Ok();
+        return MemTable::Lookup::kFound;
       case MemTable::Lookup::kDeleted:
-        return Status::NotFound("deleted: " + std::string(key));
+        return MemTable::Lookup::kDeleted;
       case MemTable::Lookup::kMissing:
         if (!s.ok()) {
-          return s;
+          if (error != nullptr) {
+            *error = s;
+          }
+          return MemTable::Lookup::kMissing;
         }
         break;
     }
+  }
+  return MemTable::Lookup::kMissing;
+}
+
+Status DB::Get(std::string_view key, std::string* value) const {
+  // Snapshot under the mutex, then read lock-free: the shared_ptrs keep
+  // the memtables and every table of the version alive even if a
+  // concurrent flush/compaction publishes a new Version right away.
+  std::shared_ptr<MemTable> mem, imm;
+  std::shared_ptr<Version> v;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    mem = mem_;
+    imm = imm_;
+    v = current_;
+  }
+
+  std::string stored;
+  Status error = Status::Ok();
+  switch (LookupIn(mem, imm, v, key, &stored, &error)) {
+    case MemTable::Lookup::kFound:
+      *value = std::move(stored);
+      return MaybeResolvePointer(value);
+    case MemTable::Lookup::kDeleted:
+      return Status::NotFound("deleted: " + std::string(key));
+    case MemTable::Lookup::kMissing:
+      // A real I/O error during table lookup must not be reported as a
+      // mere missing key.
+      if (!error.ok()) {
+        return error;
+      }
+      break;
   }
   return Status::NotFound("missing: " + std::string(key));
 }
@@ -770,11 +931,236 @@ Status DB::Scan(std::string_view begin, std::string_view end,
       has_user = true;
       current_user.assign(user);
       if ((ExtractTag(iter.key()) & 0xff) == kTypeValue) {
-        fn(user, iter.value());
+        // Separated values arrive here as 21-byte pointers; resolve them
+        // so fn sees real bytes, exactly like Get does.
+        std::string resolved(iter.value());
+        const Status s = MaybeResolvePointer(&resolved);
+        if (!s.ok()) {
+          return s;
+        }
+        fn(user, resolved);
       }
     }
     iter.Next();
   }
+  return Status::Ok();
+}
+
+// ---- value separation: pointer resolution + GC ----
+
+Status DB::MaybeResolvePointer(std::string* value) const {
+  // Inline values (separation off, or below the threshold) pass through
+  // untouched: anything that is not exactly the 21-byte 0xFF-tagged
+  // pointer shape cannot be a pointer.
+  if (value->size() != kValuePointerSize ||
+      (*value)[0] != kValuePointerTag) {
+    return Status::Ok();
+  }
+  ValuePointer p;
+  if (!DecodeValuePointer(*value, &p)) {
+    return Status::Corruption("undecodable value pointer");
+  }
+  std::string cached;
+  if (vlog_cache_.Get(*value, &cached)) {
+    *value = std::move(cached);
+    return Status::Ok();
+  }
+  // Copy the generation's shared_ptr out under the mutex, then pread
+  // lock-free — the same snapshot discipline as the Version read path.
+  const std::shared_ptr<VLog> vl = VLogFor(p.vlog_number);
+  if (vl == nullptr) {
+    return Status::Corruption("value log " + VLog::FileName(p.vlog_number) +
+                              " is gone (separation disabled after use?)");
+  }
+  std::string resolved;
+  const Status s = vl->ReadValue(p.offset, p.value_size, &resolved);
+  if (!s.ok()) {
+    return s;
+  }
+  vlog_cache_.Put(*value, resolved);
+  *value = std::move(resolved);
+  return Status::Ok();
+}
+
+std::shared_ptr<VLog> DB::VLogFor(uint64_t number) const {
+  std::lock_guard<std::mutex> lk(mutex_);
+  const auto it = vlogs_.find(number);
+  return it != vlogs_.end() ? it->second : nullptr;
+}
+
+bool DB::VlogGcNeeded() const {
+  // Mutex held (BackgroundLoop / wait_for_background_work). Triggers:
+  //   * a leftover older generation exists (a previous pass was
+  //     interrupted — it must be reclaimed, not leaked);
+  //   * the current file crossed max(vlog_gc_size_, vlog_gc_floor_).
+  // The floor is the anti-livelock device: a pass that finds the file
+  // mostly live sets floor = 2x what it rewrote, so the next rewrite
+  // only happens after enough NEW garbage accumulated. Without it, a
+  // live data volume above the configured trigger would be rewritten
+  // forever (each pass rewrites everything, file stays above trigger).
+  if (!vsep_enabled_ || vlog_current_ == nullptr) {
+    return false;
+  }
+  if (vlogs_.size() > 1) {
+    return true;
+  }
+  const uint64_t size = vlog_current_->file_size();
+  const uint64_t trigger = vlog_gc_size_ > vlog_gc_floor_ ? vlog_gc_size_
+                                                          : vlog_gc_floor_;
+  return size >= trigger;
+}
+
+Status DB::RunVlogGC() {
+  // Background thread, called WITHOUT the mutex (it releases and
+  // reacquires it many times). User writers and readers run throughout;
+  // every mutation below is under the mutex.
+  uint64_t fresh_number = 0;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    // 1. Rotate to a fresh generation FIRST: the scans below then read
+    //    files nobody appends to, and all rewrites (GC + user) land in
+    //    the new one. Publish the new generation immediately — from now
+    //    on a crash must find it named, because new WAL records already
+    //    reference it.
+    fresh_number = next_file_number_++;
+    Status s = Status::Ok();
+    auto fresh = VLog::Open(dir_, fresh_number, &s);
+    if (fresh == nullptr) {
+      next_file_number_--;
+      return s;
+    }
+    vlogs_.emplace(fresh_number, std::move(fresh));
+    vlog_current_ = vlogs_[fresh_number];
+    const Status ms = WriteManifest();
+    if (!ms.ok()) {
+      // Roll the rotation back: keep appending to the previous
+      // generation. (Concurrent writers only touched memtables/WAL —
+      // the vlog switch is invisible to them until their next write.)
+      vlogs_.erase(fresh_number);
+      vlog_current_ = std::prev(vlogs_.end())->second;
+      next_file_number_--;
+      return ms;
+    }
+  }
+
+  // 2. Scan EVERY older generation (normally one; more if a previous
+  //    GC pass was interrupted — they must not leak forever) and re-Put
+  //    live entries through the normal write path (which re-separates
+  //    into the new generation). The liveness check + re-write happen
+  //    under ONE mutex hold, so a concurrent overwrite can never slip
+  //    between "this entry is the key's current value" and writing it
+  //    back — that race would resurrect a stale value over a fresh
+  //    user write.
+  std::vector<std::shared_ptr<VLog>> retired;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (const auto& [number, vl] : vlogs_) {
+      if (number != fresh_number) {
+        retired.push_back(vl);
+      }
+    }
+  }
+
+  const auto drain_flush = [&]() -> Status {
+    // Flush a pending imm_ inline: the GC runs ON the background thread,
+    // so if it doesn't, nobody will until the scan finishes — and user
+    // writers block on a pending imm_. No lock while flushing (the
+    // callee takes the mutex itself).
+    std::shared_ptr<MemTable> imm;
+    uint64_t retired_log = 0, sst_number = 0;
+    {
+      std::lock_guard<std::mutex> lk(mutex_);
+      imm = imm_;
+      retired_log = imm_log_number_;
+      sst_number = imm_sst_number_;
+    }
+    if (imm == nullptr) {
+      return Status::Ok();
+    }
+    const Status s = FlushImmMemTable(imm, retired_log, sst_number);
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (s.ok()) {
+      imm_ = nullptr;
+    }
+    signal_.notify_all();
+    return s;
+  };
+
+  uint64_t rewritten = 0;
+  Status err = Status::Ok();
+  for (const std::shared_ptr<VLog>& gen : retired) {
+    if (!err.ok()) {
+      break;
+    }
+    const uint64_t gen_number = gen->file_number();
+    const Status scan_s = gen->ScanEntries(
+        gen->file_size(),
+        [&err, &rewritten, gen_number, this, &drain_flush](
+            std::string_view key, std::string_view value, uint64_t offset) {
+      if (!err.ok()) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(mutex_);
+        std::string stored;
+        ValuePointer p;
+        if (LookupIn(mem_, imm_, current_, key, &stored, nullptr) !=
+                MemTable::Lookup::kFound ||
+            !DecodeValuePointer(stored, &p) ||
+            p.vlog_number != gen_number || p.offset != offset) {
+          return;  // dead: overwritten, deleted, or a newer version exists
+        }
+        err = WriteEntry(kTypeValue, key, value,
+                         /*count_user_bytes=*/false);  // GC traffic, not user
+        if (err.ok()) {
+          rewritten += value.size();
+        }
+      }
+      if (err.ok()) {
+        err = drain_flush();  // rotations must not stall user writers
+      }
+    });
+    if (err.ok() && !scan_s.ok()) {
+      err = scan_s;
+    }
+  }
+  if (!err.ok()) {
+    // Best-effort: keep everything published; every rewritten entry
+    // already went through the normal (durable) write path, and the
+    // rest are still readable in their old file. A later pass retries.
+    return err;
+  }
+
+  // 3. Drop the old generations, republish the MANIFEST, then unlink.
+  //    Crash before the manifest write: all generations stay named and
+  //    the next Open re-runs GC. Crash after it: the old files are
+  //    unnamed orphans and are removed on Open.
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (const std::shared_ptr<VLog>& gen : retired) {
+      vlogs_.erase(gen->file_number());
+    }
+    // The floor is the anti-livelock device: the next rewrite waits
+    // until the file holds roughly this much NEW garbage. A pass that
+    // found the file mostly live raises the floor to 2x the live data;
+    // a pass that found mostly garbage lowers it toward zero.
+    vlog_gc_floor_ = 2 * rewritten;
+    const Status ms = WriteManifest();
+    if (!ms.ok()) {
+      // Old generations stay published and on disk; retry later. Their
+      // entries are dead already (every live one was rewritten), so the
+      // live estimate for the fresh generation stands.
+      for (const std::shared_ptr<VLog>& gen : retired) {
+        vlogs_.emplace(gen->file_number(), gen);
+      }
+      return ms;
+    }
+  }
+  for (const std::shared_ptr<VLog>& gen : retired) {
+    ::unlink(VlogPath(gen->file_number()).c_str());
+  }
+  stats_vlog_gcs_ += 1;
   return Status::Ok();
 }
 
@@ -784,7 +1170,7 @@ void DB::BackgroundLoop() {
   std::unique_lock<std::mutex> lk(mutex_);
   for (;;) {
     signal_.wait(lk, [&] {
-      return exit_ || imm_ != nullptr || CompactionNeeded();
+      return exit_ || imm_ != nullptr || CompactionNeeded() || VlogGcNeeded();
     });
     if (exit_) {
       break;
@@ -827,6 +1213,22 @@ void DB::BackgroundLoop() {
       }
       // wait_for_background_work() sleeps on "no more compaction due";
       // it must be woken to re-check that predicate after each step.
+      signal_.notify_all();
+      continue;
+    }
+    if (VlogGcNeeded()) {
+      lk.unlock();
+      const Status s = RunVlogGC();
+      lk.lock();
+      if (!s.ok()) {
+        // GC is also best-effort: the old generation stays published and
+        // nothing is lost, just not yet reclaimed. Back off like the
+        // flush path so a persistent failure doesn't spin.
+        last_error_ = s;
+        lk.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        lk.lock();
+      }
       signal_.notify_all();
     }
   }
@@ -1138,9 +1540,16 @@ size_t DB::total_file_count() const {
 }
 
 void DB::wait_for_background_work() {
+  // Holding the mutex while notifying is deliberate: the background
+  // thread may already be past its predicate re-check, and a notify
+  // sent while it evaluates work (not waiting) would be lost — the
+  // caller would then sleep on a condition only the background thread
+  // can make true (e.g. a pending vLog GC) with no further wakeups.
   std::unique_lock<std::mutex> lk(mutex_);
+  signal_.notify_all();
   signal_.wait(lk, [&] {
-    return exit_ || (imm_ == nullptr && !CompactionNeeded());
+    return exit_ ||
+           (imm_ == nullptr && !CompactionNeeded() && !VlogGcNeeded());
   });
 }
 
