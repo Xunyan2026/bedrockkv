@@ -32,6 +32,7 @@
 // fails and the caller falls back to the synchronous write path.
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -55,9 +56,14 @@ class Ring {
   Ring(const Ring&) = delete;
   Ring& operator=(const Ring&) = delete;
 
-  // Queues one IORING_OP_WRITE (pwrite semantics: explicit offset, the
-  // fd's O_APPEND flag is ignored, which is exactly the ordering story
-  // async WAL writes need — disjoint offsets, no implicit EOF race).
+  // Queues one IORING_OP_WRITE (pwrite semantics: explicit offset).
+  // CALLER CONTRACT: `fd` must NOT carry O_APPEND — on real kernels
+  // O_APPEND overrides the explicit offset (the write lands at EOF in
+  // the kernel's completion order), which would scramble an async WAL.
+  // With a plain O_RDWR fd, disjoint-offset writes may complete in any
+  // order without corrupting the record stream. The DB's sync path keeps
+  // O_APPEND on purpose (post-truncation recovery appends); the async
+  // path's WAL fds are opened without it.
   // `buf` must stay valid until the matching completion is reaped.
   // Returns false if the SQ is full — call Flush()/Reap() first.
   bool QueueWrite(int fd, const void* buf, size_t len, uint64_t offset,
@@ -86,8 +92,12 @@ class Ring {
     }
     if (wait && outstanding_ > 0) {
       // enter() with to_submit=0 and GETEVENTS: sleep until min_complete.
-      if (::syscall(kEnter, fd_, 0, outstanding_, kGetEvents, nullptr, 0) <
-          0) {
+      // EINTR-safe retry (same reasoning as Flush).
+      long rc;
+      do {
+        rc = ::syscall(kEnter, fd_, 0, outstanding_, kGetEvents, nullptr, 0);
+      } while (rc < 0 && errno == EINTR);
+      if (rc < 0) {
         return false;
       }
     }

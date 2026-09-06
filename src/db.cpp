@@ -469,8 +469,26 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   // the writer's in-block position decides where records fragment, so a
   // stale offset would corrupt the log at real block boundaries (found
   // by the reopen tests).
-  const int fd = ::open(db->LogPath(db->log_number_).c_str(),
-                        O_RDWR | O_CREAT | O_APPEND, 0644);
+  //
+  // The ring is opened BEFORE the fd: its outcome decides the O_APPEND
+  // flag. Sync WAL keeps O_APPEND (after a tail truncation, writes must
+  // continue at the NEW end of file); async WAL needs a plain O_RDWR fd
+  // because O_APPEND overrides the SQE's explicit offset on real kernels
+  // (writes land at EOF in completion order — see ring.h).
+  if (db->options_.enable_io_uring) {
+    Status rs = Status::Ok();
+    db->ring_ = Ring::Open(64, &rs);
+    if (db->ring_ != nullptr) {
+      db->io_uring_active_ = true;
+    } else {
+      db->io_uring_reason_ = rs.message();
+    }
+  } else {
+    db->io_uring_reason_ = "not requested (Options::enable_io_uring)";
+  }
+  const int wal_flags =
+      db->io_uring_active_ ? (O_RDWR | O_CREAT) : (O_RDWR | O_CREAT | O_APPEND);
+  const int fd = ::open(db->LogPath(db->log_number_).c_str(), wal_flags, 0644);
   if (fd < 0) {
     return fail("cannot open log " + DB::LogFileName(db->log_number_) +
                 ": " + std::string(std::strerror(errno)));
@@ -478,23 +496,8 @@ std::unique_ptr<DB> DB::Open(const std::string& dir, const Options& options,
   db->log_fd_ = fd;
   const uint64_t log_end = static_cast<uint64_t>(::lseek(fd, 0, SEEK_END));
   db->log_writer_ = std::make_unique<log::Writer>(fd, log_end);
-
-  // Async I/O (stage 3 batch 3). Ring creation is best-effort: a kernel
-  // or sandbox without io_uring (gVisor: ENOSYS) leaves the engine on the
-  // synchronous path — io_uring_active()/io_uring_unavailable_reason()
-  // report what happened, and the benchmark prints it. Nothing else in
-  // Open depends on this succeeding.
-  if (db->options_.enable_io_uring) {
-    Status rs = Status::Ok();
-    db->ring_ = Ring::Open(64, &rs);
-    if (db->ring_ != nullptr) {
-      db->io_uring_active_ = true;
-      db->wal_size_ = log_end;
-    } else {
-      db->io_uring_reason_ = rs.message();
-    }
-  } else {
-    db->io_uring_reason_ = "not requested (Options::enable_io_uring)";
+  if (db->io_uring_active_) {
+    db->wal_size_ = log_end;
   }
 
   // ---- 6. start the background flush/compaction thread (last: no
@@ -851,8 +854,13 @@ Status DB::RotateForFlush() {
     }
   }
   const uint64_t new_log = next_file_number_++;
+  // O_APPEND only for the sync path (see Open): async WAL writes carry
+  // explicit offsets and need a plain O_RDWR fd.
   const int fd = ::open(LogPath(new_log).c_str(),
-                        O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
+                        io_uring_active_
+                            ? (O_RDWR | O_CREAT | O_TRUNC)
+                            : (O_RDWR | O_CREAT | O_TRUNC | O_APPEND),
+                        0644);
   if (fd < 0) {
     next_file_number_--;
     return Status::IOError("cannot create " + LogFileName(new_log) + ": " +

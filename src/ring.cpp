@@ -112,8 +112,9 @@ bool Ring::QueueWrite(int fd, const void* buf, size_t len, uint64_t offset,
     return false;  // SQ full: caller must Flush() first
   }
   // Build the SQE in the shared array and register it in the index array.
-  // (Kernel 5.6+ for IORING_OP_WRITE; O_APPEND on fd is ignored — pwrite
-  // semantics — which is what makes explicit-offset WAL writes safe.)
+  // (Kernel 5.6+ for IORING_OP_WRITE. The fd must NOT be O_APPEND — see
+  // the caller-contract note in ring.h: O_APPEND overrides the explicit
+  // offset on real kernels and would scramble async WAL ordering.)
   auto* sqe = reinterpret_cast<std::byte*>(sqes_) +
                static_cast<size_t>(sq_tail_ & sq_mask_) * 64;
   std::memset(sqe, 0, 64);
@@ -159,10 +160,16 @@ bool Ring::Flush(bool wait_all) {
     *sq_tail_pub_ = sq_tail_;  // publish: kernel now owns the SQEs
   }
   // One enter() both submits and (with GETEVENTS) waits — the batching
-  // point where N syscalls collapse into one.
-  const long rc =
-      ::syscall(kEnter, fd_, to_submit, min_complete,
-                min_complete > 0 ? kGetEvents : 0u, nullptr, 0);
+  // point where N syscalls collapse into one. EINTR (a signal arrived
+  // mid-enter, possibly after some SQEs were already consumed) is safe
+  // to retry verbatim: the kernel consumes SQEs head→tail, so the retry
+  // only picks up whatever was never consumed, and a retry with
+  // GETEVENTS still blocks until min_complete completions exist.
+  long rc;
+  do {
+    rc = ::syscall(kEnter, fd_, to_submit, min_complete,
+                   min_complete > 0 ? kGetEvents : 0u, nullptr, 0);
+  } while (rc < 0 && errno == EINTR);
   if (rc < 0) {
     return false;
   }

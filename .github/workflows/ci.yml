@@ -22,4 +22,25 @@ jobs:
         run: cmake --build build -j
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure 2>&1 | tee /tmp/test_out.txt
+
+      # The job-logs API needs an authenticated token, so failures would
+      # otherwise be invisible to unauthenticated inspection. Workflow
+      # commands (::error::) surface as check-run annotations, which the
+      # public API DOES expose — emit the ctest output there (tail +
+      # head, chunked, since annotations are capped).
+      - name: Expose failure output
+        if: failure()
+        run: |
+          python3 - <<'PYEOF'
+          text = open('/tmp/test_out.txt', errors='replace').read()
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          tail = text[-24000:]
+          for i in range(0, len(tail), 3000):
+              print(f"::error::CI-TEST tail[{i//3000}]: {tail[i:i+3000]}")
+          if len(text) > 24000:
+              head = text[:3000]
+              print(f"::error::CI-TEST head: {head}")
+          PYEOF
