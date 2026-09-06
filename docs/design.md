@@ -286,9 +286,12 @@ unpublish + unlink the old ones. The three races worth writing down:
   is rewritten forever.
 - The **snapshot retirement guard** above.
 
-Known simplification, documented in the format spec: a user value that
-is exactly 21 bytes starting with `0xFF` collides with the pointer
-shape; production would add a metadata byte.
+The pointer/inline ambiguity is closed on both paths: while separation
+is enabled, a 21-byte `0xFF`-led value is separated into the vLog even
+below the threshold, so an inline slot is always unambiguously a real
+value or a real pointer; with separation disabled the read path never
+decodes pointers at all (details in the format spec; RocksDB's
+per-value metadata byte remains the production-grade scheme).
 
 ## io_uring
 
@@ -356,7 +359,7 @@ pick one or defer materialization with offsets.**
 - **Three libFuzzer harnesses** (RESP parser, WAL replay — invariant:
   truncate at last-good-end ⇒ clean replay — and the full
   parser→dispatch→DB path); 60-second smokes per target in CI,
-  23M+ execs locally, zero findings.
+  26M+ execs locally, zero findings.
 
 ## Known limitations (audited, deliberately deferred)
 
